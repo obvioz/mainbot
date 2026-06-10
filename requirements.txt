@@ -1,0 +1,5 @@
+aiogram==3.13.1
+ccxt==4.4.24
+python-dotenv==1.0.1
+pandas==2.2.3
+numpy==2.1.2
