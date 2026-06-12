@@ -123,7 +123,7 @@ def fetch_spot_balances(exchange=None) -> dict[str, dict]:
     return result
 
 
-def calc_avg_from_trades(exchange, coin: str, limit: int = 200) -> tuple[float, float, float, str]:
+def calc_avg_from_trades(exchange, coin: str, limit: int = 1000) -> tuple[float, float, float, str]:
     coin = normalize_coin(coin)
     """Best-effort average price from recent spot trades.
 
@@ -131,38 +131,61 @@ def calc_avg_from_trades(exchange, coin: str, limit: int = 200) -> tuple[float, 
     Важно: если история сделок неполная, средняя может быть приблизительной.
     """
     symbol = f"{coin}/{settings.quote}"
-    try:
-        trades = private_call_with_time_retry(exchange, exchange.fetch_my_trades, symbol, limit=limit, params={"category": "spot", "recvWindow": int(settings.bybit_recv_window)})
-    except Exception:
-        try:
-            trades = private_call_with_time_retry(exchange, exchange.fetch_my_trades, symbol, limit=limit, params={"recvWindow": int(settings.bybit_recv_window)})
-        except Exception:
-            return 0.0, 0.0, 0.0, "no_trade_history"
 
-    trades = sorted(trades or [], key=lambda t: t.get("timestamp") or 0)
+    all_trades = []
+
+    # Bybit/ccxt может вернуть неполную историю, поэтому пробуем разные лимиты.
+    for chunk in [200, 500, 1000]:
+        try:
+            trades = private_call_with_time_retry(
+                exchange,
+                exchange.fetch_my_trades,
+                symbol,
+                limit=chunk,
+                params={
+                    "category": "spot",
+                    "recvWindow": int(settings.bybit_recv_window),
+                },
+            )
+            if trades:
+                all_trades = trades
+        except Exception:
+            continue
+
+    if not all_trades:
+        return 0.0, 0.0, 0.0, "no_trade_history"
+
+    trades = sorted(all_trades or [], key=lambda t: t.get("timestamp") or 0)
+
     qty = 0.0
     cost = 0.0
+
     for t in trades:
         side = (t.get("side") or "").lower()
         amount = _safe_float(t.get("amount"))
         price = _safe_float(t.get("price"))
         trade_cost = _safe_float(t.get("cost"), amount * price)
+
         if amount <= 0 or price <= 0:
             continue
+
         if side == "buy":
             qty += amount
             cost += trade_cost
+
         elif side == "sell" and qty > 0:
             sell_qty = min(amount, qty)
             avg = cost / qty if qty else 0.0
             qty -= sell_qty
             cost -= avg * sell_qty
+
             if qty <= 1e-12:
                 qty = 0.0
                 cost = 0.0
 
     avg_price = cost / qty if qty > 1e-12 else 0.0
     source = "trades" if avg_price > 0 else "no_open_trade_cost"
+
     return avg_price, qty, cost, source
 
 
