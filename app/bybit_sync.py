@@ -125,16 +125,48 @@ def fetch_spot_balances(exchange=None) -> dict[str, dict]:
 
 def calc_avg_from_trades(exchange, coin: str, limit: int = 1000) -> tuple[float, float, float, str]:
     coin = normalize_coin(coin)
-    """Best-effort average price from recent spot trades.
-
-    Returns: avg_price, qty_open_by_trades, cost_open, source.
-    Важно: если история сделок неполная, средняя может быть приблизительной.
-    """
     symbol = f"{coin}/{settings.quote}"
+    raw_symbol = f"{coin}{settings.quote}"
 
+    def calc_from_trade_list(trades: list[dict], source_name: str) -> tuple[float, float, float, str]:
+        trades = sorted(trades or [], key=lambda t: t.get("timestamp") or t.get("execTime") or 0)
+
+        qty = 0.0
+        cost = 0.0
+
+        for t in trades:
+            side = (t.get("side") or "").lower()
+            amount = _safe_float(t.get("amount") or t.get("execQty"))
+            price = _safe_float(t.get("price") or t.get("execPrice"))
+            trade_cost = _safe_float(
+                t.get("cost") or t.get("execValue"),
+                amount * price
+            )
+
+            if amount <= 0 or price <= 0:
+                continue
+
+            if side == "buy":
+                qty += amount
+                cost += trade_cost
+
+            elif side == "sell" and qty > 0:
+                sell_qty = min(amount, qty)
+                avg = cost / qty if qty else 0.0
+                qty -= sell_qty
+                cost -= avg * sell_qty
+
+                if qty <= 1e-12:
+                    qty = 0.0
+                    cost = 0.0
+
+        avg_price = cost / qty if qty > 1e-12 else 0.0
+        source = source_name if avg_price > 0 else "no_open_trade_cost"
+        return avg_price, qty, cost, source
+
+    # 1) Сначала пробуем стандартный ccxt fetch_my_trades
     all_trades = []
 
-    # Bybit/ccxt может вернуть неполную историю, поэтому пробуем разные лимиты.
     for chunk in [200, 500, 1000]:
         try:
             trades = private_call_with_time_retry(
@@ -152,41 +184,55 @@ def calc_avg_from_trades(exchange, coin: str, limit: int = 1000) -> tuple[float,
         except Exception:
             continue
 
-    if not all_trades:
-        return 0.0, 0.0, 0.0, "no_trade_history"
+    if all_trades:
+        avg_price, qty, cost, source = calc_from_trade_list(all_trades, "trades")
+        if avg_price > 0:
+            return avg_price, qty, cost, source
 
-    trades = sorted(all_trades or [], key=lambda t: t.get("timestamp") or 0)
+    # 2) Fallback: Bybit raw endpoint /v5/execution/list
+    # Нужен, потому что Bybit иногда не отдаёт spot сделки через ccxt fetch_my_trades.
+    raw_trades = []
 
-    qty = 0.0
-    cost = 0.0
+    try:
+        cursor = None
 
-    for t in trades:
-        side = (t.get("side") or "").lower()
-        amount = _safe_float(t.get("amount"))
-        price = _safe_float(t.get("price"))
-        trade_cost = _safe_float(t.get("cost"), amount * price)
+        for _ in range(5):  # максимум 5 страниц по 100 сделок
+            params = {
+                "category": "spot",
+                "symbol": raw_symbol,
+                "limit": 100,
+                "recvWindow": int(settings.bybit_recv_window),
+            }
 
-        if amount <= 0 or price <= 0:
-            continue
+            if cursor:
+                params["cursor"] = cursor
 
-        if side == "buy":
-            qty += amount
-            cost += trade_cost
+            resp = private_call_with_time_retry(
+                exchange,
+                exchange.privateGetV5ExecutionList,
+                params,
+            )
 
-        elif side == "sell" and qty > 0:
-            sell_qty = min(amount, qty)
-            avg = cost / qty if qty else 0.0
-            qty -= sell_qty
-            cost -= avg * sell_qty
+            result = resp.get("result") or {}
+            rows = result.get("list") or []
 
-            if qty <= 1e-12:
-                qty = 0.0
-                cost = 0.0
+            if rows:
+                raw_trades.extend(rows)
 
-    avg_price = cost / qty if qty > 1e-12 else 0.0
-    source = "trades" if avg_price > 0 else "no_open_trade_cost"
+            cursor = result.get("nextPageCursor")
 
-    return avg_price, qty, cost, source
+            if not cursor:
+                break
+
+    except Exception:
+        raw_trades = []
+
+    if raw_trades:
+        avg_price, qty, cost, source = calc_from_trade_list(raw_trades, "bybit_execution")
+        if avg_price > 0:
+            return avg_price, qty, cost, source
+
+    return 0.0, 0.0, 0.0, "no_trade_history"
 
 
 def build_bybit_assets() -> tuple[list[BybitAsset], dict]:
