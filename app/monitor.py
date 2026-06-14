@@ -8,17 +8,21 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from app.market import analyze_market, make_exchange, fetch_ohlcv_df
-from app.signals import classify_signal, format_compact_signal, get_market_regime
+from app.signals import classify_signal, format_compact_signal
 from app.settings import settings
 from app.storage import load_portfolio, save_portfolio
 from app.formatters import fmt_usdt, fmt_money
 from app.strategy_params import get_tp_levels
-from app.config import CATEGORIES, TAKE_PROFIT_LEVELS
+from app.config import CATEGORIES
 from app.market_intelligence import build_market_context
 from app.bybit_portfolio_monitor import check_bybit_portfolio_changes
+from app.rotation_lab import rotation_tick
 
 STATE_PATH = Path("data/monitor_state.json")
 SIGNAL_STATUSES = {"STRONG_BUY", "ACCUMULATION"}
+
+# Rotation Lab пока работает только в demo/simulation режиме.
+ROTATION_INTERVAL_SECONDS = 5 * 60
 
 
 def signal_keyboard(coin: str) -> InlineKeyboardMarkup:
@@ -141,6 +145,34 @@ def build_position_alerts(items: list[dict]) -> list[str]:
     return messages
 
 
+def format_rotation_event(result: dict) -> str | None:
+    """Красивое уведомление для Telegram по событиям Rotation Lab."""
+    status = result.get("status")
+
+    if status == "opened":
+        return (
+            "🧪 DEMO ENTRY\n\n"
+            f"Пара: {result.get('pair')}\n"
+            f"Score: {result.get('score', '?')}\n"
+            f"1h: {float(result.get('change_1h') or 0):+.2f}%\n"
+            f"3h: {float(result.get('change_3h') or 0):+.2f}%\n"
+            f"Объём: x{float(result.get('volume_growth') or 0):.2f}\n"
+            f"BTC demo: {float(result.get('virtual_btc') or 0):.8f}"
+        )
+
+    if status == "closed":
+        return (
+            "🧪 DEMO EXIT\n\n"
+            f"Пара: {result.get('pair')}\n"
+            f"Причина: {result.get('reason')}\n"
+            f"Результат: {float(result.get('result_pct') or 0):+.2f}%\n"
+            f"BTC: {float(result.get('btc_before') or 0):.8f} → "
+            f"{float(result.get('btc_after') or 0):.8f}"
+        )
+
+    return None
+
+
 async def monitor_loop(bot: Bot) -> None:
     if not settings.telegram_allowed_user_id:
         print("AUTO_MONITOR: TELEGRAM_ALLOWED_USER_ID не задан, фоновые сигналы отключены.")
@@ -148,22 +180,32 @@ async def monitor_loop(bot: Bot) -> None:
 
     chat_id = int(settings.telegram_allowed_user_id)
     interval_seconds = max(settings.scan_interval_minutes, 1) * 60
+
     await bot.send_message(
         chat_id,
-        f"🟢 Автомониторинг v14 запущен. Интервал рынка: {settings.scan_interval_minutes} мин.\n"
+        f"🟢 Автомониторинг v15 запущен.\n"
+        f"Рынок: {settings.scan_interval_minutes} мин.\n"
         f"Bybit portfolio monitor: {'включен' if settings.bybit_portfolio_monitor_enabled else 'выключен'} "
-        f"каждые {settings.bybit_portfolio_monitor_minutes} мин.\n"
-        "Команды: /status /scan /positions /bybit /syncbybit"
+        f"/ {settings.bybit_portfolio_monitor_minutes} мин.\n"
+        f"Rotation Lab demo: включен / каждые {ROTATION_INTERVAL_SECONDS // 60} мин.\n\n"
+        "Команды: /status /scan /positions /bybit /syncbybit /rotation"
     )
 
     last_market_scan = 0.0
     last_bybit_scan = 0.0
+    last_rotation_scan = 0.0
+
     bybit_interval = max(settings.bybit_portfolio_monitor_minutes, 1) * 60
 
     while True:
         now = time.monotonic()
 
-        if settings.bybit_portfolio_monitor_enabled and settings.bybit_api_key and settings.bybit_api_secret and (now - last_bybit_scan >= bybit_interval):
+        if (
+            settings.bybit_portfolio_monitor_enabled
+            and settings.bybit_api_key
+            and settings.bybit_api_secret
+            and (now - last_bybit_scan >= bybit_interval)
+        ):
             try:
                 messages = await asyncio.to_thread(check_bybit_portfolio_changes, True)
                 for text in messages:
@@ -172,6 +214,18 @@ async def monitor_loop(bot: Bot) -> None:
             except Exception as exc:
                 await bot.send_message(chat_id, f"⚠️ Ошибка Bybit-монитора: {exc}")
                 last_bybit_scan = now
+
+        # Rotation Lab demo tick
+        if now - last_rotation_scan >= ROTATION_INTERVAL_SECONDS:
+            try:
+                result = await asyncio.to_thread(rotation_tick)
+                text = format_rotation_event(result)
+                if text:
+                    await bot.send_message(chat_id, text)
+                last_rotation_scan = now
+            except Exception as exc:
+                await bot.send_message(chat_id, f"⚠️ Ошибка Rotation Lab: {exc}")
+                last_rotation_scan = now
 
         if now - last_market_scan >= interval_seconds:
             try:
