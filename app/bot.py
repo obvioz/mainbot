@@ -5,6 +5,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, FSInputFile, ErrorEvent
 from aiogram.exceptions import TelegramBadRequest
 
+
 from app.settings import settings
 from app.config import normalize_coin
 from app.market import analyze_market, make_exchange, analyze_coin, fetch_ohlcv_df
@@ -31,6 +32,12 @@ from app.strategy_params import format_strategy_params
 from app.bootstrap import auto_strategy_bootstrap
 from app.market_cache import get_cached
 from app.market_memory import record_scan_snapshot, latest_snapshot, snapshot_delta, format_delta_report, format_memory_status
+from app.rotation_lab import (
+    rotation_tick,
+    rotation_summary,
+    rotation_history,
+    rotation_reset,
+)
 
 PENDING_BUY: dict[int, str] = {}
 SCAN_LOCK = asyncio.Lock()
@@ -80,6 +87,7 @@ def main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="👁️ Проверить Bybit"), KeyboardButton(text="🧠 Review")],
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🛡️ Риски")],
             [KeyboardButton(text="🧪 Lab"), KeyboardButton(text="🧪 Backtest")],
+            [KeyboardButton(text="🧪 Демо торговля"), KeyboardButton(text="📜 Демо журнал")],
             [KeyboardButton(text="🧬 Robust"), KeyboardButton(text="📈 Reliability")],
             [KeyboardButton(text="🤖 ML Dataset"), KeyboardButton(text="⚙️ Параметры")],
             [KeyboardButton(text="📦 Лог для ChatGPT"), KeyboardButton(text="⚠️ Ошибки")],
@@ -1163,6 +1171,33 @@ async def pending_buy_amount_handler(message: Message):
         )
     except Exception as exc:
         await message.answer(f"Не смог записать покупку: {exc}")
+async def cmd_rotation(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    await message.answer(await asyncio.to_thread(rotation_summary))
+
+
+async def cmd_rotation_history(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    await message.answer(await asyncio.to_thread(rotation_history))
+
+
+async def cmd_rotation_tick(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    res = await asyncio.to_thread(rotation_tick)
+    await message.answer(f"🧪 Rotation tick\n\n{res}")
+
+
+async def cmd_rotation_reset(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    await message.answer(await asyncio.to_thread(rotation_reset))        
 
 
 async def main():
@@ -1171,81 +1206,146 @@ async def main():
 
     bot = Bot(token=settings.telegram_bot_token)
     dp = Dispatcher()
+
+    # Команды
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_portfolio, Command("portfolio"))
     dp.message.register(cmd_portfolio, Command("plan"))
     dp.message.register(cmd_positions, Command("positions"))
+
     dp.message.register(cmd_bybit, Command("bybit"))
     dp.message.register(cmd_syncbybit, Command("syncbybit"))
     dp.message.register(cmd_bybitcheck, Command("bybitcheck"))
+
     dp.message.register(cmd_review, Command("review"))
     dp.message.register(cmd_risk, Command("risk"))
+
     dp.message.register(cmd_scan, Command("scan"))
     dp.message.register(cmd_status, Command("status"))
     dp.message.register(cmd_changes, Command("changes"))
     dp.message.register(cmd_memory, Command("memory"))
+
     dp.message.register(cmd_price, Command("price"))
     dp.message.register(cmd_funding, Command("funding"))
     dp.message.register(cmd_news, Command("news"))
+
     dp.message.register(cmd_backtest, Command("backtest"))
     dp.message.register(cmd_backtestall, Command("backtestall"))
+
     dp.message.register(cmd_lab, Command("lab"))
+
     dp.message.register(cmd_strategyparams, Command("strategyparams"))
     dp.message.register(cmd_robust, Command("robust"))
     dp.message.register(cmd_reliability, Command("reliability"))
+
     dp.message.register(cmd_note, Command("note"))
+
     dp.message.register(cmd_logsummary, Command("logsummary"))
     dp.message.register(cmd_exportlog, Command("exportlog"))
+
     dp.message.register(cmd_errors, Command("errors"))
     dp.message.register(cmd_exporterrors, Command("exporterrors"))
+
     dp.message.register(cmd_mldataset, Command("mldataset"))
     dp.message.register(cmd_mldataset, Command("mlsummary"))
+
     dp.message.register(cmd_buy, Command("buy"))
     dp.message.register(cmd_sell, Command("sell"))
+
     dp.message.register(cmd_journal, Command("journal"))
     dp.message.register(cmd_stats, Command("stats"))
     dp.message.register(cmd_export, Command("export"))
+
     dp.message.register(cmd_monitor, Command("monitor"))
 
-    # Постоянная клавиатура снизу
+    # Rotation Lab
+    dp.message.register(cmd_rotation, Command("rotation"))
+    dp.message.register(cmd_rotation_history, Command("rotationhistory"))
+    dp.message.register(cmd_rotation_tick, Command("rotationtick"))
+    dp.message.register(cmd_rotation_reset, Command("rotationreset"))
+
+    # Кнопки
     dp.message.register(btn_scan, F.text.in_({"📊 Скан", "🔍 Скан"}))
     dp.message.register(btn_status, F.text.in_({"🌍 Статус", "🌍 Рынок"}))
+
     dp.message.register(cmd_changes, F.text == "📈 Изменения")
     dp.message.register(cmd_memory, F.text == "🧠 Память")
+
     dp.message.register(btn_positions, F.text == "💼 Позиции")
+
     dp.message.register(cmd_bybit, F.text == "🔗 Bybit")
     dp.message.register(cmd_syncbybit, F.text == "🔄 Sync Bybit")
-    dp.message.register(cmd_bybitcheck, F.text.in_({"👁️ Bybit Check", "👁️ Проверить Bybit"}))
+
+    dp.message.register(
+        cmd_bybitcheck,
+        F.text.in_({"👁️ Bybit Check", "👁️ Проверить Bybit"}),
+    )
+
     dp.message.register(cmd_review, F.text == "🧠 Review")
+
     dp.message.register(btn_lab, F.text == "🧪 Lab")
     dp.message.register(btn_robust, F.text == "🧬 Robust")
+
     dp.message.register(cmd_reliability, F.text == "📈 Reliability")
+
     dp.message.register(btn_backtest, F.text == "🧪 Backtest")
+
     dp.message.register(btn_mldataset, F.text == "🤖 ML Dataset")
+
     dp.message.register(cmd_strategyparams, F.text == "⚙️ Параметры")
+
     dp.message.register(btn_errors, F.text == "⚠️ Ошибки")
+
     dp.message.register(btn_journal, F.text == "📒 Журнал")
+
     dp.message.register(btn_stats, F.text == "📊 Статистика")
+
     dp.message.register(btn_risk, F.text == "🛡️ Риски")
+
     dp.message.register(btn_export, F.text == "📤 CSV")
+
     dp.message.register(btn_funding, F.text == "🧨 Funding/OI")
+
     dp.message.register(btn_news, F.text == "📰 Новости")
+
     dp.message.register(btn_price, F.text == "💵 Цена")
+
     dp.message.register(btn_buy, F.text == "➕ Покупка")
+
     dp.message.register(btn_sell, F.text == "➖ Продажа")
+
     dp.message.register(btn_monitor, F.text == "🤖 Монитор")
+
     dp.message.register(btn_help, F.text == "❓ Помощь")
+
+    # Rotation кнопки
+    dp.message.register(
+        cmd_rotation,
+        F.text == "🧪 Демо торговля",
+    )
+
+    dp.message.register(
+        cmd_rotation_history,
+        F.text == "📜 Демо журнал",
+    )
 
     dp.errors.register(on_error)
     dp.callback_query.register(on_callback)
-    dp.message.register(pending_buy_amount_handler, F.text)
+
+    dp.message.register(
+        pending_buy_amount_handler,
+        F.text,
+    )
 
     if settings.auto_monitor_enabled:
-        asyncio.create_task(monitor_loop(bot))
+        asyncio.create_task(
+            monitor_loop(bot)
+        )
 
-    # Автоматически готовим robust-рейтинг и параметры стратегии, если их нет/они устарели.
-    asyncio.create_task(auto_strategy_bootstrap(bot))
+    asyncio.create_task(
+        auto_strategy_bootstrap(bot)
+    )
 
     await dp.start_polling(bot)
 
