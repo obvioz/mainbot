@@ -81,17 +81,10 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     """
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔍 Скан"), KeyboardButton(text="📈 Изменения")],
-            [KeyboardButton(text="🌍 Рынок"), KeyboardButton(text="🧠 Память")],
+            [KeyboardButton(text="🔍 Скан"), KeyboardButton(text="🌍 Рынок")],
             [KeyboardButton(text="💼 Позиции"), KeyboardButton(text="🔗 Bybit")],
-            [KeyboardButton(text="👁️ Проверить Bybit"), KeyboardButton(text="🧠 Review")],
-            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🛡️ Риски")],
-            [KeyboardButton(text="🧪 Lab"), KeyboardButton(text="🧪 Backtest")],
-            [KeyboardButton(text="🧪 Демо торговля"), KeyboardButton(text="📜 Демо журнал")],
-            [KeyboardButton(text="🧬 Robust"), KeyboardButton(text="📈 Reliability")],
-            [KeyboardButton(text="🤖 ML Dataset"), KeyboardButton(text="⚙️ Параметры")],
-            [KeyboardButton(text="📦 Лог для ChatGPT"), KeyboardButton(text="⚠️ Ошибки")],
-            [KeyboardButton(text="🤖 Монитор"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="🧠 Review"), KeyboardButton(text="🛡️ Риски")],
+            [KeyboardButton(text="📈 Изменения"), KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери действие",
