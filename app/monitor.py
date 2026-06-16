@@ -8,7 +8,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from app.market import analyze_market, make_exchange, fetch_ohlcv_df
-from app.signals import classify_signal, format_compact_signal
+from app.signals import classify_signal, format_compact_signal, format_core_signal
 from app.settings import settings
 from app.storage import load_portfolio, save_portfolio
 from app.formatters import fmt_usdt, fmt_money
@@ -25,10 +25,13 @@ SIGNAL_STATUSES = {"STRONG_BUY", "ACCUMULATION"}
 ROTATION_INTERVAL_SECONDS = 5 * 60
 
 
-def signal_keyboard(coin: str) -> InlineKeyboardMarkup:
+def signal_keyboard(coin: str, entry_usdt: float = 0) -> InlineKeyboardMarkup:
+    amount_label = f"${entry_usdt:.0f}" if entry_usdt else "?"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Я купил {coin}", callback_data=f"buy:{coin}")],
-        [InlineKeyboardButton(text="💼 Позиции", callback_data="positions")]
+        [
+            InlineKeyboardButton(text=f"✅ Купить {amount_label}", callback_data=f"buy_now:{coin}:{entry_usdt:.2f}"),
+            InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip"),
+        ],
     ])
 
 
@@ -53,12 +56,15 @@ def signal_key(item: dict, signal: dict) -> str:
     return f"{coin}:{signal.get('status')}:{rounded_price}"
 
 
-def build_monitor_signals(items: list[dict], market_context: dict | None = None) -> list[tuple[str, str]]:
+CORE_COINS = {"BTC", "ETH"}
+
+
+def build_monitor_signals(items: list[dict], market_context: dict | None = None) -> list[tuple[str, str, float]]:
     btc = next((x for x in items if x.get("coin") == "BTC"), None)
     if market_context is None:
         market_context = build_market_context(items)
     state = load_state()
-    messages: list[tuple[str, str]] = []
+    messages: list[tuple[str, str, float]] = []
 
     for item in items:
         if "error" in item:
@@ -73,7 +79,12 @@ def build_monitor_signals(items: list[dict], market_context: dict | None = None)
         if state.get(f"signal_{coin}") == key:
             continue
         state[f"signal_{coin}"] = key
-        messages.append((format_compact_signal(item, signal), coin))
+        entry_usdt = float(signal.get("entry_usdt") or 0)
+        if coin in CORE_COINS:
+            text = format_core_signal(item, signal)
+        else:
+            text = format_compact_signal(item, signal)
+        messages.append((text, coin, entry_usdt))
 
     state["_last_scan"] = datetime.now().isoformat(timespec="seconds")
     save_state(state)
@@ -233,8 +244,9 @@ async def monitor_loop(bot: Bot) -> None:
                 exchange = make_exchange()
                 market_context = await asyncio.to_thread(build_market_context, items, exchange, fetch_ohlcv_df)
                 signal_messages = build_monitor_signals(items, market_context)
-                for text, coin in signal_messages:
-                    await bot.send_message(chat_id, text, reply_markup=signal_keyboard(coin))
+                for text, coin, entry_usdt in signal_messages:
+                    kb = signal_keyboard(coin, entry_usdt) if coin not in CORE_COINS else None
+                    await bot.send_message(chat_id, text, reply_markup=kb)
                 for text in build_position_alerts(items):
                     await bot.send_message(chat_id, text)
                 last_market_scan = now

@@ -37,6 +37,8 @@ from app.rotation_lab import (
     rotation_summary,
     rotation_history,
     rotation_reset,
+    rotation_report,
+    export_rotation_csv,
 )
 
 PENDING_BUY: dict[int, str] = {}
@@ -61,15 +63,13 @@ def is_allowed(message_or_call) -> bool:
     return str(user.id) == str(settings.telegram_allowed_user_id)
 
 
-def signal_keyboard(coin: str) -> InlineKeyboardMarkup:
-    """Кнопки под сигналом.
-
-    Покупку/продажу больше не предлагаем записывать вручную: Bybit — источник истины.
-    Если пользователь купил монету на бирже, бот увидит это через Bybit Monitor / Sync.
-    """
+def signal_keyboard(coin: str, entry_usdt: float = 0) -> InlineKeyboardMarkup:
+    amount_label = f"${entry_usdt:.0f}" if entry_usdt else "?"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💼 Позиции", callback_data="positions")],
-        [InlineKeyboardButton(text="🧠 Review", callback_data="review")],
+        [
+            InlineKeyboardButton(text=f"✅ Купить {amount_label}", callback_data=f"buy_now:{coin}:{entry_usdt:.2f}"),
+            InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip"),
+        ],
     ])
 
 
@@ -291,7 +291,8 @@ async def cmd_scan(message: Message):
                     continue
                 signal = classify_signal(item, btc, market_context)
                 if signal.get("status") in {"STRONG_BUY", "ACCUMULATION"} and sent_cards < 5:
-                    await message.answer(format_compact_signal(item, signal), reply_markup=signal_keyboard(item["coin"]))
+                    entry_usdt = float(signal.get("entry_usdt") or 0)
+                    await message.answer(format_compact_signal(item, signal), reply_markup=signal_keyboard(item["coin"], entry_usdt))
                     sent_cards += 1
         except Exception as exc:
             try:
@@ -1086,7 +1087,27 @@ async def on_callback(call: CallbackQuery):
 
     data = call.data or ""
 
-    if data.startswith("buy:"):
+    if data.startswith("buy_now:"):
+        parts = data.split(":")
+        if len(parts) >= 3:
+            coin = parts[1]
+            try:
+                entry_usdt = float(parts[2])
+            except ValueError:
+                entry_usdt = 0.0
+            try:
+                price = await get_current_price(coin)
+                record_buy(coin, entry_usdt, price, reason="signal_button")
+                await call.message.answer(
+                    f"✅ Записано: {coin} ${entry_usdt:.0f} по ${fmt_usdt(price)}"
+                )
+            except Exception as exc:
+                await call.message.answer(f"Ошибка записи покупки: {exc}")
+
+    elif data == "skip":
+        pass
+
+    elif data.startswith("buy:"):
         coin = data.split(":", 1)[1]
         PENDING_BUY[call.from_user.id] = coin
         await call.message.answer(
@@ -1190,7 +1211,33 @@ async def cmd_rotation_reset(message: Message):
     if not is_allowed(message):
         await message.answer("Нет доступа.")
         return
-    await message.answer(await asyncio.to_thread(rotation_reset))        
+    await message.answer(await asyncio.to_thread(rotation_reset))
+
+
+async def cmd_rotationreport(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        report7 = await asyncio.to_thread(rotation_report, 7)
+        report30 = await asyncio.to_thread(rotation_report, 30)
+        for chunk in split_text(report7):
+            await message.answer(chunk)
+        for chunk in split_text(report30):
+            await message.answer(chunk)
+    except Exception as exc:
+        await message.answer(f"Ошибка rotation report: {exc}")
+
+
+async def cmd_exportrotation(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        path = await asyncio.to_thread(export_rotation_csv, 30)
+        await message.answer_document(FSInputFile(path), caption="📊 Rotation Lab CSV (30д)")
+    except Exception as exc:
+        await message.answer(f"Ошибка экспорта rotation CSV: {exc}")
 
 
 async def main():
@@ -1257,6 +1304,8 @@ async def main():
     dp.message.register(cmd_rotation_history, Command("rotationhistory"))
     dp.message.register(cmd_rotation_tick, Command("rotationtick"))
     dp.message.register(cmd_rotation_reset, Command("rotationreset"))
+    dp.message.register(cmd_rotationreport, Command("rotationreport"))
+    dp.message.register(cmd_exportrotation, Command("exportrotation"))
 
     # Кнопки
     dp.message.register(btn_scan, F.text.in_({"📊 Скан", "🔍 Скан"}))

@@ -470,15 +470,13 @@ def _signal_card(item: dict, signal: dict, detailed: bool = True) -> str:
 
     deriv = signal.get("derivatives") or item.get("derivatives") or {}
     news = signal.get("news_risk") or item.get("news_risk") or {}
-    if deriv:
+    if deriv and deriv.get("funding_state") == "OVERHEATED":
         f_pct = deriv.get("funding_pct")
-        f_text = "нет данных" if f_pct is None else f"{float(f_pct):+.3f}%"
-        oi_state = deriv.get("oi_state", "UNKNOWN")
-        lines.append(f"Funding/OI: {f_text} | {oi_state}")
-    if news:
-        lines.append(f"News Risk: {news.get('state','UNKNOWN')} ({news.get('risk_score',0)}/100)")
-
-    if coin != "BTC":
+        f_text = f"{float(f_pct):+.3f}%" if f_pct is not None else "?"
+        lines.append(f"⚠️ Funding OVERHEATED: {f_text}")
+    if news and news.get("state", "UNKNOWN") != "UNKNOWN":
+        lines.append(f"News Risk: {news.get('state')} ({news.get('risk_score', 0)}/100)")
+    if coin != "BTC" and strength.get("state", "NEUTRAL") != "NEUTRAL":
         lines.append(f"Сила к BTC: {strength.get('state','?')} ({strength.get('delta_7d',0):+.1f}%)")
 
     if pos:
@@ -511,11 +509,6 @@ def _signal_card(item: dict, signal: dict, detailed: bool = True) -> str:
         lines.append("Почему:")
         for r in reasons:
             lines.append(f"• {r}")
-
-    if detailed and not pos:
-        zones = _buy_zones_from_current(item)
-        if zones:
-            lines.extend(["", zones])
 
     return "\n".join(lines)
 
@@ -651,4 +644,88 @@ def format_signal_report(items: list[dict], market_context: dict | None = None) 
     return "\n".join(lines)
 
 def format_compact_signal(item: dict, signal: dict) -> str:
-    return _signal_card(item, signal, detailed=True)
+    """Компактная карточка сигнала для автомонитора (альты)."""
+    coin = item["coin"]
+    current = float(item.get("current", 0) or 0)
+    dd30 = float(item.get("drawdown_30d_high", 0) or 0)
+    vclass = item.get("volatility_class", "?")
+    score = int(signal.get("score", 0))
+    status = signal.get("status", "WATCH")
+    entry_usdt = float(signal.get("entry_usdt", 0) or 0)
+    pos = get_position(coin)
+
+    status_map = {
+        "STRONG_BUY": ("🟢", "STRONG BUY"),
+        "ACCUMULATION": ("🟡", "ACCUMULATION"),
+        "WATCH": ("⚪", "WATCH"),
+        "AVOID": ("🔴", "AVOID"),
+    }
+    emoji, status_label = status_map.get(status, ("⚪", status))
+
+    entry_count = int(pos.get("entry_count", 0)) if pos else 0
+    tranche = entry_count + 1
+
+    dca_levels = item.get("dca_levels") or []
+    if pos and float(pos.get("next_buy_price", 0) or 0) and current:
+        next_price = float(pos["next_buy_price"])
+        next_pct = (next_price / current - 1) * 100
+        next_text = f"${fmt_usdt(next_price)} ({next_pct:+.1f}%)"
+    elif len(dca_levels) >= 2 and current:
+        level_pct = float(dca_levels[1])
+        next_price = current * (1 - level_pct / 100)
+        next_text = f"${fmt_usdt(next_price)} (-{level_pct:.0f}%)"
+    else:
+        next_text = "нет данных"
+
+    amount_text = f"${entry_usdt:.0f} USDT" if entry_usdt else "—"
+    reasons = signal.get("reasons") or []
+    short_reason = reasons[0] if reasons else "нет данных"
+    if len(short_reason) > 70:
+        short_reason = short_reason[:67] + "…"
+
+    return "\n".join([
+        f"{emoji} {coin} — {status_label}",
+        f"Цена: ${fmt_usdt(current)} | Просадка: {dd30:+.1f}% от 30д high",
+        f"Транш {tranche} из 3 | Сумма: {amount_text}",
+        f"Следующий уровень: {next_text}",
+        "",
+        f"📊 Score: {score}/100 | Волатильность: {vclass}",
+        f"💡 {short_reason}",
+    ])
+
+
+def format_core_signal(item: dict, signal: dict) -> str:
+    """Инфо-уведомление для BTC и ETH (без кнопок)."""
+    coin = item["coin"]
+    current = float(item.get("current", 0) or 0)
+    dd30 = float(item.get("drawdown_30d_high", 0) or 0)
+    score = int(signal.get("score", 0))
+    status = signal.get("status", "WATCH")
+    entry_usdt = float(signal.get("entry_usdt", 0) or 0)
+    pos = get_position(coin)
+
+    entry_count = int(pos.get("entry_count", 0)) if pos else 0
+    tranche = entry_count + 1
+
+    dca_levels = item.get("dca_levels") or []
+    if pos and float(pos.get("next_buy_price", 0) or 0) and current:
+        next_price = float(pos["next_buy_price"])
+        next_pct = (next_price / current - 1) * 100
+        next_text = f"${fmt_usdt(next_price)} ({next_pct:+.1f}%)"
+    elif len(dca_levels) >= 2 and current:
+        level_pct = float(dca_levels[1])
+        next_price = current * (1 - level_pct / 100)
+        next_text = f"${fmt_usdt(next_price)} (-{level_pct:.0f}%)"
+    else:
+        next_text = "нет данных"
+
+    amount_text = f"${entry_usdt:.0f}" if entry_usdt else "—"
+    status_label = {"STRONG_BUY": "STRONG BUY"}.get(status, status)
+
+    return "\n".join([
+        f"✅ Автовход {coin} — {status_label}",
+        f"Сумма: {amount_text} по ${fmt_usdt(current)}",
+        f"Транш {tranche} из 3",
+        f"Следующий уровень: {next_text}",
+        f"Просадка: {dd30:+.1f}% | Score: {score}/100",
+    ])

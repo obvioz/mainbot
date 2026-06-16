@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import csv
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -302,6 +303,7 @@ def open_virtual_trade(lab: dict[str, Any], pair_data: dict[str, Any]) -> dict[s
 
     lab["active_trade"] = trade
 
+    atr_pct = atr / entry_price * 100 if entry_price > 0 else 0.0
     _append_journal(lab, {
         "time": now_iso(),
         "action": "OPEN",
@@ -309,10 +311,21 @@ def open_virtual_trade(lab: dict[str, Any], pair_data: dict[str, Any]) -> dict[s
         "price": entry_price,
         "atr": atr,
         "initial_stop": initial_stop,
+        "initial_stop_price": initial_stop,
+        "atr_at_entry": atr,
         "btc_before": btc_before,
         "btc_after": btc_before,
         "score": trade["entry_score"],
         "pullback_pct": trade["entry_pullback_pct"],
+        "entry_reason": {
+            "score": trade["entry_score"],
+            "pullback_pct": trade["entry_pullback_pct"],
+            "atr_pct": round(atr_pct, 4),
+            "uptrend": trade["entry_uptrend"],
+            "volume_ratio": trade["entry_volume_ratio"],
+            "ema_fast": float(pair_data.get("ema9") or 0),
+            "ema_slow": float(pair_data.get("ema30") or 0),
+        },
         "note": (
             f"score={trade['entry_score']} | "
             f"pullback={trade['entry_pullback_pct']:+.2f}% | "
@@ -339,6 +352,32 @@ def close_virtual_trade(lab: dict[str, Any], exit_price: float, reason: str) -> 
     btc_after = btc_before * (1 + result_pct / 100)
     lab["virtual_btc"] = btc_after
 
+    highest_price = float(trade.get("highest_price") or entry_price)
+    trailing_activated = bool(trade.get("trailing_activated", False))
+    trailing_stop_val = float(trade.get("trailing_stop") or trade.get("initial_stop") or 0)
+
+    duration_hours: float = 0.0
+    try:
+        opened_at = datetime.fromisoformat(trade["opened_at"])
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        duration_hours = round((datetime.now(timezone.utc) - opened_at).total_seconds() / 3600, 2)
+    except Exception:
+        pass
+
+    if reason == "trailing_stop":
+        exit_reason_detail = (
+            f"Трейлинг стоп: цена {float(exit_price):.6f} опустилась ниже трейлинга "
+            f"{trailing_stop_val:.6f} (макс. цена {highest_price:.6f})"
+        )
+    elif reason == "stop_loss":
+        initial_stop = float(trade.get("initial_stop") or 0)
+        exit_reason_detail = (
+            f"Стоп лосс: цена {float(exit_price):.6f} достигла начального стопа {initial_stop:.6f}"
+        )
+    else:
+        exit_reason_detail = reason
+
     _append_journal(lab, {
         "time": now_iso(),
         "action": "CLOSE",
@@ -349,6 +388,11 @@ def close_virtual_trade(lab: dict[str, Any], exit_price: float, reason: str) -> 
         "btc_before": btc_before,
         "btc_after": btc_after,
         "reason": reason,
+        "highest_price_reached": highest_price,
+        "trailing_activated": trailing_activated,
+        "trailing_stop_at_close": trailing_stop_val,
+        "duration_hours": duration_hours,
+        "exit_reason_detail": exit_reason_detail,
     })
 
     lab["active_trade"] = None
@@ -587,3 +631,124 @@ def rotation_history(limit: int = 20) -> str:
             )
 
     return "\n".join(lines)
+
+
+def _filter_closed_by_days(journal: list, days: int) -> list:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    result = []
+    for row in journal:
+        if row.get("action") != "CLOSE":
+            continue
+        try:
+            t = datetime.fromisoformat(row["time"])
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            if t >= cutoff:
+                result.append(row)
+        except Exception:
+            continue
+    return result
+
+
+def rotation_report(days: int = 7) -> str:
+    lab = load_rotation_state()
+    journal = lab.get("journal") or []
+    closed = _filter_closed_by_days(journal, days)
+
+    if not closed:
+        return f"📊 ROTATION REPORT ({days}д)\n\nСделок за период нет."
+
+    wins = [x for x in closed if float(x.get("result_pct") or 0) > 0]
+    losses = [x for x in closed if float(x.get("result_pct") or 0) <= 0]
+    winrate = len(wins) / len(closed) * 100
+
+    avg_win = sum(float(x.get("result_pct") or 0) for x in wins) / len(wins) if wins else 0.0
+    avg_loss = sum(float(x.get("result_pct") or 0) for x in losses) / len(losses) if losses else 0.0
+    ratio = abs(avg_win / avg_loss) if avg_loss != 0 else float("inf")
+
+    btc_result = sum(
+        float(r.get("btc_after") or 0) - float(r.get("btc_before") or 0)
+        for r in closed
+    )
+
+    sorted_trades = sorted(closed, key=lambda x: float(x.get("result_pct") or 0), reverse=True)
+    top3 = sorted_trades[:3]
+    worst3 = list(reversed(sorted_trades[-3:]))
+
+    lines = [
+        f"📊 ROTATION REPORT ({days}д)",
+        f"Период: последние {days} дней",
+        "",
+        f"Всего сделок: {len(closed)}",
+        f"Выигрышных: {len(wins)} | Проигрышных: {len(losses)}",
+        f"Винрейт: {winrate:.1f}%",
+        f"Средний профит победителей: {avg_win:+.2f}%",
+        f"Средний убыток проигравших: {avg_loss:+.2f}%",
+        f"Profit/Loss ratio: {ratio:.2f}" if ratio != float('inf') else "Profit/Loss ratio: ∞ (убытков нет)",
+        f"Итог BTC за период: {btc_result:+.8f} BTC",
+        "",
+        "Топ-3 лучших:",
+    ]
+    for i, t in enumerate(top3, 1):
+        detail = t.get("exit_reason_detail") or t.get("reason") or ""
+        lines.append(f"  {i}. {t.get('pair')} {float(t.get('result_pct') or 0):+.2f}% | {detail}")
+
+    lines += ["", "Топ-3 худших:"]
+    for i, t in enumerate(worst3, 1):
+        detail = t.get("exit_reason_detail") or t.get("reason") or ""
+        lines.append(f"  {i}. {t.get('pair')} {float(t.get('result_pct') or 0):+.2f}% | {detail}")
+
+    return "\n".join(lines)
+
+
+def export_rotation_csv(days: int = 30) -> Path:
+    lab = load_rotation_state()
+    journal = lab.get("journal") or []
+    closed = _filter_closed_by_days(journal, days)
+
+    reports_dir = Path("reports")
+    reports_dir.mkdir(exist_ok=True)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    path = reports_dir / f"rotation_{days}d_{ts}.csv"
+
+    fieldnames = [
+        "time", "pair", "entry_price", "exit_price", "result_pct",
+        "btc_before", "btc_after", "reason", "duration_hours",
+        "highest_price_reached", "trailing_activated", "trailing_stop_at_close",
+        "exit_reason_detail", "initial_stop_price", "atr_at_entry",
+        "er_score", "er_pullback_pct", "er_atr_pct", "er_uptrend",
+        "er_volume_ratio", "er_ema_fast", "er_ema_slow",
+    ]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in closed:
+            er = row.get("entry_reason") or {}
+            writer.writerow({
+                "time": row.get("time"),
+                "pair": row.get("pair"),
+                "entry_price": row.get("entry_price"),
+                "exit_price": row.get("exit_price"),
+                "result_pct": row.get("result_pct"),
+                "btc_before": row.get("btc_before"),
+                "btc_after": row.get("btc_after"),
+                "reason": row.get("reason"),
+                "duration_hours": row.get("duration_hours"),
+                "highest_price_reached": row.get("highest_price_reached"),
+                "trailing_activated": row.get("trailing_activated"),
+                "trailing_stop_at_close": row.get("trailing_stop_at_close"),
+                "exit_reason_detail": row.get("exit_reason_detail"),
+                "initial_stop_price": row.get("initial_stop_price"),
+                "atr_at_entry": row.get("atr_at_entry"),
+                "er_score": er.get("score"),
+                "er_pullback_pct": er.get("pullback_pct"),
+                "er_atr_pct": er.get("atr_pct"),
+                "er_uptrend": er.get("uptrend"),
+                "er_volume_ratio": er.get("volume_ratio"),
+                "er_ema_fast": er.get("ema_fast"),
+                "er_ema_slow": er.get("ema_slow"),
+            })
+
+    return path
