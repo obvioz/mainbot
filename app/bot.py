@@ -40,6 +40,14 @@ from app.rotation_lab import (
     rotation_report,
     export_rotation_csv,
 )
+from app.futures_lab import (
+    futures_tick,
+    futures_summary,
+    futures_report,
+    export_futures_csv,
+    futures_reset,
+    futures_set_enabled,
+)
 
 PENDING_BUY: dict[int, str] = {}
 SCAN_LOCK = asyncio.Lock()
@@ -1185,6 +1193,39 @@ async def pending_buy_amount_handler(message: Message):
         )
     except Exception as exc:
         await message.answer(f"Не смог записать покупку: {exc}")
+async def cmd_futures(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    await message.answer(await asyncio.to_thread(futures_summary))
+
+
+async def cmd_futuresreport(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        report7 = await asyncio.to_thread(futures_report, 7)
+        report30 = await asyncio.to_thread(futures_report, 30)
+        for chunk in split_text(report7):
+            await message.answer(chunk)
+        for chunk in split_text(report30):
+            await message.answer(chunk)
+    except Exception as exc:
+        await message.answer(f"Ошибка futures report: {exc}")
+
+
+async def cmd_exportfutures(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        path = await asyncio.to_thread(export_futures_csv, 30)
+        await message.answer_document(FSInputFile(path), caption="📊 Futures Lab CSV (30д)")
+    except Exception as exc:
+        await message.answer(f"Ошибка экспорта futures CSV: {exc}")
+
+
 async def cmd_rotation(message: Message):
     if not is_allowed(message):
         await message.answer("Нет доступа.")
@@ -1298,6 +1339,11 @@ async def main():
     dp.message.register(cmd_export, Command("export"))
 
     dp.message.register(cmd_monitor, Command("monitor"))
+
+    # Futures Lab
+    dp.message.register(cmd_futures, Command("futures"))
+    dp.message.register(cmd_futuresreport, Command("futuresreport"))
+    dp.message.register(cmd_exportfutures, Command("exportfutures"))
 
     # Rotation Lab
     dp.message.register(cmd_rotation, Command("rotation"))

@@ -17,12 +17,13 @@ from app.config import CATEGORIES
 from app.market_intelligence import build_market_context
 from app.bybit_portfolio_monitor import check_bybit_portfolio_changes
 from app.rotation_lab import rotation_tick
+from app.futures_lab import futures_tick, format_futures_event
 
 STATE_PATH = Path("data/monitor_state.json")
 SIGNAL_STATUSES = {"STRONG_BUY", "ACCUMULATION"}
 
-# Rotation Lab пока работает только в demo/simulation режиме.
 ROTATION_INTERVAL_SECONDS = 5 * 60
+FUTURES_INTERVAL_SECONDS = 5 * 60
 
 
 def signal_keyboard(coin: str, entry_usdt: float = 0) -> InlineKeyboardMarkup:
@@ -198,13 +199,15 @@ async def monitor_loop(bot: Bot) -> None:
         f"Рынок: {settings.scan_interval_minutes} мин.\n"
         f"Bybit portfolio monitor: {'включен' if settings.bybit_portfolio_monitor_enabled else 'выключен'} "
         f"/ {settings.bybit_portfolio_monitor_minutes} мин.\n"
-        f"Rotation Lab demo: включен / каждые {ROTATION_INTERVAL_SECONDS // 60} мин.\n\n"
-        "Команды: /status /scan /positions /bybit /syncbybit /rotation"
+        f"Rotation Lab demo: каждые {ROTATION_INTERVAL_SECONDS // 60} мин.\n"
+        f"Futures Lab demo: каждые {FUTURES_INTERVAL_SECONDS // 60} мин.\n\n"
+        "Команды: /status /scan /positions /bybit /syncbybit /rotation /futures"
     )
 
     last_market_scan = 0.0
     last_bybit_scan = 0.0
     last_rotation_scan = 0.0
+    last_futures_scan = 0.0
 
     bybit_interval = max(settings.bybit_portfolio_monitor_minutes, 1) * 60
 
@@ -237,6 +240,18 @@ async def monitor_loop(bot: Bot) -> None:
             except Exception as exc:
                 await bot.send_message(chat_id, f"⚠️ Ошибка Rotation Lab: {exc}")
                 last_rotation_scan = now
+
+        # Futures Lab demo tick
+        if now - last_futures_scan >= FUTURES_INTERVAL_SECONDS:
+            try:
+                result = await asyncio.to_thread(futures_tick)
+                text = format_futures_event(result.get("event"))
+                if text:
+                    await bot.send_message(chat_id, text)
+                last_futures_scan = now
+            except Exception as exc:
+                await bot.send_message(chat_id, f"⚠️ Ошибка Futures Lab: {exc}")
+                last_futures_scan = now
 
         if now - last_market_scan >= interval_seconds:
             try:

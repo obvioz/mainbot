@@ -32,13 +32,14 @@ TIMEFRAME = "1h"
 CANDLE_LIMIT = 60
 
 VIRTUAL_BTC_START = 1.0
-MIN_ENTRY_SCORE = 60
+MIN_ENTRY_SCORE = 75
 MAX_JOURNAL_ROWS = 1000
 
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 1.0
-PULLBACK_MIN_PCT = -0.3   # минимальный откат от 6-свечного максимума
-PEAK_PENALTY_PCT = 0.5    # если цена ближе к пику чем 0.5% — штраф
+ATR_MULTIPLIER = 2.0      # анализ: при pull<=-0.6%+score>=70 дно дает -0.9% от входа, 1.5x недостаточно
+PULLBACK_MIN_PCT = -0.6   # было -0.3: откаты -0.31..-0.40% давали max_up=0..+0.22% → немедленный стоп
+PEAK_PENALTY_PCT = 0.6    # было 0.5: согласовано с новым PULLBACK_MIN_PCT
+STOP_COOLDOWN_HOURS = 2.0  # пауза после стоп-лосса перед следующим входом в ту же пару
 
 
 def now_iso() -> str:
@@ -106,6 +107,7 @@ def default_rotation_state() -> dict[str, Any]:
         "journal": [],
         "last_tick": None,
         "last_event": None,
+        "stop_cooldowns": {},
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
@@ -130,6 +132,7 @@ def load_rotation_state() -> dict[str, Any]:
     lab.setdefault("journal", [])
     lab.setdefault("last_tick", None)
     lab.setdefault("last_event", None)
+    lab.setdefault("stop_cooldowns", {})
     lab.setdefault("created_at", now_iso())
     lab.setdefault("updated_at", now_iso())
 
@@ -244,10 +247,27 @@ def analyze_rotation_market() -> list[dict[str, Any]]:
     return rows
 
 
-def find_best_pair(exchange) -> dict[str, Any] | None:
+def _is_on_cooldown(lab: dict[str, Any], pair: str) -> bool:
+    cooldowns = lab.get("stop_cooldowns") or {}
+    ts_str = cooldowns.get(pair)
+    if not ts_str:
+        return False
+    try:
+        ts = datetime.fromisoformat(ts_str)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+        return elapsed < STOP_COOLDOWN_HOURS
+    except Exception:
+        return False
+
+
+def find_best_pair(exchange, lab: dict[str, Any] | None = None) -> dict[str, Any] | None:
     candidates: list[dict[str, Any]] = []
 
     for pair in load_rotation_pairs("BTC"):
+        if lab is not None and _is_on_cooldown(lab, pair):
+            continue
         try:
             data = analyze_pair(exchange, pair)
             if data:
@@ -395,6 +415,9 @@ def close_virtual_trade(lab: dict[str, Any], exit_price: float, reason: str) -> 
         "exit_reason_detail": exit_reason_detail,
     })
 
+    if reason in ("stop_loss", "trailing_stop") and result_pct < 0:
+        lab.setdefault("stop_cooldowns", {})[trade["pair"]] = now_iso()
+
     lab["active_trade"] = None
     return lab
 
@@ -442,13 +465,16 @@ def rotation_tick() -> dict[str, Any]:
             reason = "trailing_stop" if active.get("trailing_activated") else "stop_loss"
             lab = close_virtual_trade(lab, current_price, reason)
             save_rotation_state(lab)
+            last_event = lab.get("last_event") or {}
             return {
                 "status": "closed",
                 "reason": reason,
                 "pair": pair,
                 "result_pct": result_pct,
                 "virtual_btc": float(lab["virtual_btc"]),
-                "event": lab.get("last_event"),
+                "btc_before": last_event.get("btc_before"),
+                "btc_after": last_event.get("btc_after"),
+                "event": last_event,
             }
 
         save_rotation_state(lab)
@@ -461,7 +487,7 @@ def rotation_tick() -> dict[str, Any]:
             "virtual_btc": float(lab["virtual_btc"]),
         }
 
-    best = find_best_pair(exchange)
+    best = find_best_pair(exchange, lab)
 
     if best:
         lab = open_virtual_trade(lab, best)
