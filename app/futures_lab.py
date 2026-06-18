@@ -15,8 +15,29 @@ FUTURES_KEY = "futures_lab"
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 LEVERAGE = 5
 VIRTUAL_USDT_START = 1000.0
-RISK_PER_TRADE = 0.02
+RISK_PER_TRADE = 0.02  # legacy fallback; live sizing uses get_risk_pct(score)
 MAX_CONCURRENT = 1
+
+# ─── Score-based position sizing & portfolio risk ceiling ──────────────────────
+MIN_ENTRY_SCORE = 70               # signals below this are not traded at all
+# Risk % of deposit by signal score. Ordered high→low; first matching threshold wins.
+RISK_TIERS: list[tuple[float, float]] = [
+    (85.0, 3.0),   # score 85-100 → 3% (confident)
+    (75.0, 2.0),   # score 75-84  → 2% (average)
+    (70.0, 1.0),   # score 70-74  → 1% (weak)
+]
+MAX_PORTFOLIO_RISK_PCT = 6.0       # total open risk ceiling across all positions
+MIN_RISK_PCT = 0.5                 # below this remaining headroom, do not enter at all
+
+
+def get_risk_pct(score: float | None) -> float:
+    """Risk % of deposit for a given signal score. Below MIN_ENTRY_SCORE → 0 (no entry)."""
+    if score is None or score < MIN_ENTRY_SCORE:
+        return 0.0
+    for threshold, pct in RISK_TIERS:
+        if score >= threshold:
+            return pct
+    return 0.0
 TIMEFRAME = "1h"
 CANDLE_LIMIT = 100
 ATR_PERIOD = 14
@@ -25,9 +46,142 @@ TP_RISK_RATIO = 2.0
 BREAKOUT_PERIOD = 20
 MAX_JOURNAL_ROWS = 2000
 
+# ─── Circuit breakers ──────────────────────────────────────────────────────────
+DAILY_LOSS_LIMIT_PCT = 6.0          # stop new entries if day loss reaches this % of day-start balance
+MAX_CONSECUTIVE_LOSSES = 3          # consecutive losing trades that trigger a pause
+COOLDOWN_AFTER_LOSSES_HOURS = 6     # pause length after MAX_CONSECUTIVE_LOSSES
+STOP_COOLDOWN_HOURS = 2             # do not re-enter the same symbol for this long after a stop
+SHORT_STOP_ATR_MULT = 1.0          # tighter stop for shorts (vs ATR_STOP_MULT for longs)
+PUMP_GUARD_PCT = 5.0               # emergency-exit a short if price pumps >= this % in one 1h candle
+VOL_GUARD_ATR_MULT = 2.0           # block new shorts if latest ATR > this * average ATR
+REGIME_EMA_PERIOD = 50             # EMA period (1h) used for market-regime filter
+REGIME_SLOPE_LOOKBACK = 3          # candles back to measure EMA50 slope
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        t = datetime.fromisoformat(value)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t
+    except Exception:
+        return None
+
+
+def _stop_mult(side: str) -> float:
+    """Asymmetric stop distance — shorts use a tighter stop (unbounded upside risk)."""
+    return SHORT_STOP_ATR_MULT if side == "short" else ATR_STOP_MULT
+
+
+def _classify_regime(price: float, ema50: float, ema50_prev: float) -> str:
+    """uptrend / downtrend / range based on price vs EMA50(1h) and EMA50 slope."""
+    if any(math.isnan(x) for x in (price, ema50, ema50_prev)):
+        return "range"
+    slope = ema50 - ema50_prev
+    if price < ema50 and slope < 0:
+        return "downtrend"
+    if price > ema50 and slope > 0:
+        return "uptrend"
+    return "range"
+
+
+def _entry_allowed_by_regime(side: str, regime: str) -> bool:
+    """Symmetric trend filter: no longs into a downtrend, no shorts into an uptrend."""
+    if side == "long" and regime == "downtrend":
+        return False
+    if side == "short" and regime == "uptrend":
+        return False
+    return True
+
+
+def _short_pump_pct(candles: list, current_price: float) -> float:
+    """Max single-1h-candle upside move (open→high / open→current), used for pump guard."""
+    moves: list[float] = []
+    try:
+        # In-progress candle: open → current live price
+        cur_open = float(candles[-1][1])
+        if cur_open > 0:
+            moves.append((current_price - cur_open) / cur_open * 100.0)
+            moves.append((float(candles[-1][2]) - cur_open) / cur_open * 100.0)
+        # Last closed candle: open → high
+        prev_open = float(candles[-2][1])
+        if prev_open > 0:
+            moves.append((float(candles[-2][2]) - prev_open) / prev_open * 100.0)
+    except (IndexError, ValueError, TypeError):
+        return 0.0
+    return max(moves) if moves else 0.0
+
+
+def _current_day_loss_pct(lab: dict[str, Any]) -> float:
+    start = float(lab.get("day_start_balance") or 0)
+    cur = float(lab.get("virtual_usdt") or 0)
+    if start <= 0:
+        return 0.0
+    return max(0.0, (start - cur) / start * 100.0)
+
+
+def _roll_day(lab: dict[str, Any]) -> dict[str, Any]:
+    """Reset the daily-loss baseline at the start of a new UTC day."""
+    today = _today_utc()
+    if lab.get("day_start_date") != today:
+        lab["day_start_date"] = today
+        lab["day_start_balance"] = float(lab.get("virtual_usdt") or VIRTUAL_USDT_START)
+        lab["daily_limit_notified_date"] = None
+    return lab
+
+
+def _log_blocked_entry(
+    lab: dict[str, Any], symbol: str, side: str, strategy: str, regime: str, reason: str
+) -> None:
+    lab.setdefault("blocked_entries", [])
+    lab["blocked_entries"].append({
+        "time": now_iso(),
+        "symbol": symbol,
+        "side": side,
+        "strategy": strategy,
+        "regime": regime,
+        "reason": reason,
+    })
+    lab["blocked_entries"] = lab["blocked_entries"][-MAX_JOURNAL_ROWS:]
+
+
+def _global_entry_block(lab: dict[str, Any], now: datetime) -> str | None:
+    """Account-wide entry blocks (apply to every signal, both sides)."""
+    if _current_day_loss_pct(lab) >= DAILY_LOSS_LIMIT_PCT:
+        return "daily_loss_limit"
+    until = _parse_iso(lab.get("losses_cooldown_until"))
+    if until and now < until:
+        return "consecutive_loss_cooldown"
+    return None
+
+
+def _signal_entry_block(lab: dict[str, Any], signal: dict[str, Any], now: datetime) -> str | None:
+    """Per-signal entry blocks: trend regime, short volatility guard, per-symbol stop cooldown."""
+    side = signal["side"]
+    symbol = signal["symbol"]
+    regime = signal.get("regime", "range")
+
+    if not _entry_allowed_by_regime(side, regime):
+        return f"regime_{regime}"
+
+    if side == "short" and signal.get("atr_extreme"):
+        return "extreme_volatility"
+
+    until = _parse_iso((lab.get("stop_cooldowns") or {}).get(symbol))
+    if until and now < until:
+        return "stop_cooldown"
+
+    return None
 
 
 def make_futures_exchange():
@@ -89,11 +243,56 @@ def _stop_is_safe(entry: float, stop: float, side: str, leverage: int) -> bool:
     return entry < stop < liq
 
 
-def _calc_position_size(deposit: float, entry: float, stop: float) -> float:
+def _calc_position_size(deposit: float, entry: float, stop: float, risk_pct: float) -> float:
+    """Notional size so that hitting the stop loses risk_pct (%) of deposit."""
+    if entry <= 0:
+        return 0.0
     stop_distance_pct = abs(entry - stop) / entry
     if stop_distance_pct <= 0:
         return 0.0
-    return (deposit * RISK_PER_TRADE) / stop_distance_pct
+    return (deposit * (risk_pct / 100.0)) / stop_distance_pct
+
+
+def _position_risk_pct(trade: dict[str, Any], deposit: float) -> float:
+    """% of deposit lost if this position's protective stop is hit."""
+    entry = float(trade.get("entry_price") or 0)
+    stop = float(trade.get("trailing_stop") or trade.get("stop_price") or 0)
+    pos = float(trade.get("position_size_usdt") or 0)
+    if entry <= 0 or deposit <= 0 or stop <= 0:
+        return 0.0
+    stop_distance_pct = abs(entry - stop) / entry
+    return pos * stop_distance_pct / deposit * 100.0
+
+
+def _open_positions(lab: dict[str, Any]) -> list[dict[str, Any]]:
+    """All currently open positions. Generalized for MAX_CONCURRENT > 1; today ≤ 1."""
+    positions: list[dict[str, Any]] = []
+    active = lab.get("active_trade")
+    if active:
+        positions.append(active)
+    positions.extend(lab.get("open_positions") or [])
+    return positions
+
+
+def _current_portfolio_risk_pct(lab: dict[str, Any]) -> float:
+    deposit = float(lab.get("virtual_usdt") or 0)
+    return sum(_position_risk_pct(t, deposit) for t in _open_positions(lab))
+
+
+def _resolve_entry_risk(score: float, portfolio_risk_before: float) -> tuple[float, float, bool, str | None]:
+    """Decide actual risk for a new entry under the portfolio ceiling.
+
+    Returns (actual_risk_pct, assigned_risk_pct, was_trimmed, blocked_reason).
+    """
+    assigned = get_risk_pct(score)
+    if assigned <= 0:
+        return 0.0, 0.0, False, "score_below_min"
+    remaining = MAX_PORTFOLIO_RISK_PCT - portfolio_risk_before
+    if assigned <= remaining:
+        return assigned, assigned, False, None
+    if remaining >= MIN_RISK_PCT:
+        return round(remaining, 4), assigned, True, None
+    return 0.0, assigned, False, "portfolio_risk_ceiling"
 
 
 def default_futures_state() -> dict[str, Any]:
@@ -105,6 +304,14 @@ def default_futures_state() -> dict[str, Any]:
         "journal": [],
         "last_tick": None,
         "last_event": None,
+        # Circuit-breaker state
+        "day_start_date": _today_utc(),
+        "day_start_balance": VIRTUAL_USDT_START,
+        "daily_limit_notified_date": None,
+        "consecutive_losses": 0,
+        "losses_cooldown_until": None,
+        "stop_cooldowns": {},
+        "blocked_entries": [],
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
@@ -127,6 +334,13 @@ def load_futures_state() -> dict[str, Any]:
     lab.setdefault("journal", [])
     lab.setdefault("last_tick", None)
     lab.setdefault("last_event", None)
+    lab.setdefault("day_start_date", _today_utc())
+    lab.setdefault("day_start_balance", float(lab.get("virtual_usdt") or VIRTUAL_USDT_START))
+    lab.setdefault("daily_limit_notified_date", None)
+    lab.setdefault("consecutive_losses", 0)
+    lab.setdefault("losses_cooldown_until", None)
+    lab.setdefault("stop_cooldowns", {})
+    lab.setdefault("blocked_entries", [])
 
     return lab
 
@@ -159,6 +373,7 @@ def _analyze_symbol(exchange, symbol: str) -> dict[str, Any] | None:
 
     ema9_list = _compute_ema(closes, 9)
     ema30_list = _compute_ema(closes, 30)
+    ema50_list = _compute_ema(closes, REGIME_EMA_PERIOD)
     atrs = _compute_atr(candles, ATR_PERIOD)
 
     ema9 = ema9_list[-1]
@@ -172,15 +387,132 @@ def _analyze_symbol(exchange, symbol: str) -> dict[str, Any] | None:
     high20 = max(highs[-BREAKOUT_PERIOD - 1:-1])
     low20 = min(lows[-BREAKOUT_PERIOD - 1:-1])
 
+    # Market regime via EMA50(1h) level + slope
+    ema50 = ema50_list[-1]
+    ema50_prev = (
+        ema50_list[-1 - REGIME_SLOPE_LOOKBACK]
+        if len(ema50_list) > REGIME_SLOPE_LOOKBACK else float("nan")
+    )
+    regime = _classify_regime(current, ema50, ema50_prev)
+
+    # Extreme volatility: latest ATR vs average ATR over the window
+    valid_atrs = [a for a in atrs if not math.isnan(a) and a > 0]
+    atr_avg = sum(valid_atrs) / len(valid_atrs) if valid_atrs else atr
+    atr_extreme = atr > VOL_GUARD_ATR_MULT * atr_avg if atr_avg > 0 else False
+
     return {
         "symbol": symbol,
         "current": current,
         "ema9": ema9,
         "ema30": ema30,
+        "ema50": ema50,
         "atr": atr,
+        "atr_avg": atr_avg,
+        "atr_extreme": atr_extreme,
+        "regime": regime,
         "high20": high20,
         "low20": low20,
     }
+
+
+# ─── Signal scoring (0-100) ────────────────────────────────────────────────────
+# Each strategy scores its own setup — the four components (trend / magnitude /
+# regime / volatility) mean different things per strategy, so they are NOT shared.
+# Components are logged individually (score_components) so factor attribution is
+# possible offline: which factors actually predict profitable trades.
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _vol_component(atr: float, atr_avg: float, max_pts: float = 15.0) -> float:
+    """Calm volatility scores high; expansion toward 2x average decays to 0."""
+    if atr_avg <= 0:
+        return round(max_pts * 0.5, 2)
+    ratio = atr / atr_avg
+    return round(_clamp(2.0 - ratio, 0.0, 1.0) * max_pts, 2)
+
+
+def _regime_alignment(side: str, regime: str) -> str:
+    if regime == "range":
+        return "range"
+    aligned = (side == "long" and regime == "uptrend") or (side == "short" and regime == "downtrend")
+    return "aligned" if aligned else "opposed"
+
+
+def _score_trend_pullback(data: dict[str, Any], side: str) -> tuple[float, dict[str, float]]:
+    """Trend-following: reward strong trend, clean pullback depth, aligned regime, calm vol."""
+    ema9, ema30, atr, current = data["ema9"], data["ema30"], data["atr"], data["current"]
+    atr_avg = float(data.get("atr_avg") or atr)
+    regime = data.get("regime", "range")
+
+    # trend (0-30): EMA9/EMA30 separation in ATR units; ~1.5 ATR gap = full strength
+    gap_atr = abs(ema9 - ema30) / atr if atr > 0 else 0.0
+    trend = round(_clamp(gap_atr / 1.5, 0.0, 1.0) * 30.0, 2)
+
+    # magnitude (0-30): pullback depth within the EMA band (toward EMA30 = deeper = better entry)
+    band = abs(ema9 - ema30)
+    depth = ((ema9 - current) if side == "long" else (current - ema9)) / band if band > 0 else 0.0
+    magnitude = round(_clamp(depth, 0.0, 1.0) * 30.0, 2)
+
+    align = _regime_alignment(side, regime)
+    regime_pts = {"aligned": 25.0, "range": 12.0, "opposed": 0.0}[align]
+    volatility = _vol_component(atr, atr_avg)
+
+    components = {"trend": trend, "magnitude": magnitude, "regime": regime_pts, "volatility": volatility}
+    score = round(_clamp(trend + magnitude + regime_pts + volatility, 0.0, 100.0), 1)
+    return score, components
+
+
+def _score_mean_reversion(data: dict[str, Any], side: str) -> tuple[float, dict[str, float]]:
+    """Counter-trend: reward big deviation, calm/flat trend, range regime, calm vol."""
+    ema9, ema30, atr, current = data["ema9"], data["ema30"], data["atr"], data["current"]
+    atr_avg = float(data.get("atr_avg") or atr)
+    regime = data.get("regime", "range")
+
+    # trend (0-25): mean reversion prefers a FLAT trend → small EMA separation scores high
+    gap_atr = abs(ema9 - ema30) / atr if atr > 0 else 0.0
+    trend = round(_clamp(1.0 - gap_atr / 1.5, 0.0, 1.0) * 25.0, 2)
+
+    # magnitude (0-35): deviation beyond 2 ATR; 2 ATR → 10pts, 4 ATR → 35pts
+    dev_atr = abs(current - ema30) / atr if atr > 0 else 0.0
+    magnitude = round(_clamp((dev_atr - 2.0) / 2.0, 0.0, 1.0) * 25.0 + 10.0, 2) if dev_atr >= 2.0 else 0.0
+
+    # regime (0-25): range is ideal for reversion; an active trend is risky to fade
+    regime_pts = 25.0 if regime == "range" else 8.0
+    volatility = _vol_component(atr, atr_avg)
+
+    components = {"trend": trend, "magnitude": magnitude, "regime": regime_pts, "volatility": volatility}
+    score = round(_clamp(trend + magnitude + regime_pts + volatility, 0.0, 100.0), 1)
+    return score, components
+
+
+def _score_breakout(data: dict[str, Any], side: str) -> tuple[float, dict[str, float]]:
+    """Momentum: reward decisive break distance, EMA/trend alignment, aligned regime, vol."""
+    ema9, ema30, atr, current = data["ema9"], data["ema30"], data["atr"], data["current"]
+    atr_avg = float(data.get("atr_avg") or atr)
+    regime = data.get("regime", "range")
+    high20, low20 = data["high20"], data["low20"]
+
+    # magnitude (0-30): how far beyond the level, in ATR units; 1 ATR clear = full
+    if side == "long":
+        dist_atr = (current - high20) / atr if atr > 0 else 0.0
+    else:
+        dist_atr = (low20 - current) / atr if atr > 0 else 0.0
+    magnitude = round(_clamp(dist_atr, 0.0, 1.0) * 30.0, 2)
+
+    # trend (0-30): EMA alignment with the breakout direction; misaligned = small floor
+    gap_atr = abs(ema9 - ema30) / atr if atr > 0 else 0.0
+    aligned = (side == "long" and ema9 > ema30) or (side == "short" and ema9 < ema30)
+    trend = round(_clamp(gap_atr / 1.5, 0.0, 1.0) * 30.0, 2) if aligned else 5.0
+
+    align = _regime_alignment(side, regime)
+    regime_pts = {"aligned": 25.0, "range": 12.0, "opposed": 0.0}[align]
+    volatility = _vol_component(atr, atr_avg)
+
+    components = {"trend": trend, "magnitude": magnitude, "regime": regime_pts, "volatility": volatility}
+    score = round(_clamp(trend + magnitude + regime_pts + volatility, 0.0, 100.0), 1)
+    return score, components
 
 
 def _signal_trend_pullback(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -194,9 +526,12 @@ def _signal_trend_pullback(data: dict[str, Any]) -> dict[str, Any] | None:
     if ema9 > ema30 and ema30 < current < ema9:
         stop = current - ATR_STOP_MULT * atr
         if _stop_is_safe(current, stop, "long", LEVERAGE):
+            score, components = _score_trend_pullback(data, "long")
             return {
                 "side": "long",
                 "stop_price": stop,
+                "score": score,
+                "score_components": components,
                 "entry_reason": {
                     "ema9": round(ema9, 4),
                     "ema30": round(ema30, 4),
@@ -207,11 +542,14 @@ def _signal_trend_pullback(data: dict[str, Any]) -> dict[str, Any] | None:
 
     # SHORT: downtrend (EMA9 < EMA30), price bounced above EMA9 but still below EMA30
     if ema9 < ema30 and ema9 < current < ema30:
-        stop = current + ATR_STOP_MULT * atr
+        stop = current + _stop_mult("short") * atr
         if _stop_is_safe(current, stop, "short", LEVERAGE):
+            score, components = _score_trend_pullback(data, "short")
             return {
                 "side": "short",
                 "stop_price": stop,
+                "score": score,
+                "score_components": components,
                 "entry_reason": {
                     "ema9": round(ema9, 4),
                     "ema30": round(ema30, 4),
@@ -233,9 +571,12 @@ def _signal_mean_reversion(data: dict[str, Any]) -> dict[str, Any] | None:
     if deviation < -2.0 * atr:
         stop = current - ATR_STOP_MULT * atr
         if _stop_is_safe(current, stop, "long", LEVERAGE):
+            score, components = _score_mean_reversion(data, "long")
             return {
                 "side": "long",
                 "stop_price": stop,
+                "score": score,
+                "score_components": components,
                 "entry_reason": {
                     "ema30": round(ema30, 4),
                     "atr": round(atr, 4),
@@ -246,11 +587,14 @@ def _signal_mean_reversion(data: dict[str, Any]) -> dict[str, Any] | None:
             }
 
     if deviation > 2.0 * atr:
-        stop = current + ATR_STOP_MULT * atr
+        stop = current + _stop_mult("short") * atr
         if _stop_is_safe(current, stop, "short", LEVERAGE):
+            score, components = _score_mean_reversion(data, "short")
             return {
                 "side": "short",
                 "stop_price": stop,
+                "score": score,
+                "score_components": components,
                 "entry_reason": {
                     "ema30": round(ema30, 4),
                     "atr": round(atr, 4),
@@ -273,9 +617,12 @@ def _signal_breakout(data: dict[str, Any]) -> dict[str, Any] | None:
     if current > high20:
         stop = high20 - 0.5 * atr
         if _stop_is_safe(current, stop, "long", LEVERAGE):
+            score, components = _score_breakout(data, "long")
             return {
                 "side": "long",
                 "stop_price": stop,
+                "score": score,
+                "score_components": components,
                 "entry_reason": {
                     "high20": round(high20, 4),
                     "atr": round(atr, 4),
@@ -287,9 +634,12 @@ def _signal_breakout(data: dict[str, Any]) -> dict[str, Any] | None:
     if current < low20:
         stop = low20 + 0.5 * atr
         if _stop_is_safe(current, stop, "short", LEVERAGE):
+            score, components = _score_breakout(data, "short")
             return {
                 "side": "short",
                 "stop_price": stop,
+                "score": score,
+                "score_components": components,
                 "entry_reason": {
                     "low20": round(low20, 4),
                     "atr": round(atr, 4),
@@ -317,22 +667,38 @@ def _scan_for_signals(exchange) -> list[dict[str, Any]]:
                 continue
             for strategy_name, finder in _STRATEGY_FINDERS.items():
                 result = finder(data)
-                if result:
-                    signals.append({
-                        "symbol": symbol,
-                        "strategy": strategy_name,
-                        "current": data["current"],
-                        "atr": data["atr"],
-                        **result,
-                    })
+                if not result:
+                    continue
+                # Score gate: skip setups weaker than MIN_ENTRY_SCORE.
+                if float(result.get("score") or 0) < MIN_ENTRY_SCORE:
+                    continue
+                signals.append({
+                    "symbol": symbol,
+                    "strategy": strategy_name,
+                    "current": data["current"],
+                    "atr": data["atr"],
+                    "regime": data.get("regime", "range"),
+                    "atr_avg": data.get("atr_avg"),
+                    "atr_extreme": data.get("atr_extreme", False),
+                    **result,
+                })
         except Exception:
             continue
+    # Prefer the highest-conviction signal first.
+    signals.sort(key=lambda s: float(s.get("score") or 0), reverse=True)
     return signals
 
 
 # ─── Trade lifecycle ──────────────────────────────────────────────────────────
 
-def _open_trade(lab: dict[str, Any], signal: dict[str, Any]) -> dict[str, Any]:
+def _open_trade(
+    lab: dict[str, Any],
+    signal: dict[str, Any],
+    risk_pct: float = RISK_PER_TRADE * 100,
+    assigned_risk_pct: float | None = None,
+    was_trimmed: bool = False,
+    portfolio_risk_before: float = 0.0,
+) -> dict[str, Any]:
     deposit = float(lab["virtual_usdt"])
     entry_price = float(signal["current"])
     stop_price = float(signal["stop_price"])
@@ -341,7 +707,13 @@ def _open_trade(lab: dict[str, Any], signal: dict[str, Any]) -> dict[str, Any]:
     strategy = signal["strategy"]
     atr = float(signal.get("atr") or 0)
 
-    position_size_usdt = _calc_position_size(deposit, entry_price, stop_price)
+    actual_risk_pct = float(risk_pct)
+    if assigned_risk_pct is None:
+        assigned_risk_pct = actual_risk_pct
+    score = signal.get("score")
+    score_components = signal.get("score_components") or {}
+
+    position_size_usdt = _calc_position_size(deposit, entry_price, stop_price, actual_risk_pct)
     liq_price = _liquidation_price(entry_price, side, LEVERAGE)
 
     risk_distance = abs(entry_price - stop_price)
@@ -350,6 +722,21 @@ def _open_trade(lab: dict[str, Any], signal: dict[str, Any]) -> dict[str, Any]:
         if side == "long"
         else entry_price - TP_RISK_RATIO * risk_distance
     )
+
+    regime = signal.get("regime", "range")
+    consecutive_losses = int(lab.get("consecutive_losses") or 0)
+    day_loss_pct = round(_current_day_loss_pct(lab), 3)
+    entry_reason = dict(signal.get("entry_reason") or {})
+    entry_reason["market_regime"] = regime
+
+    risk_fields = {
+        "score": score,
+        "score_components": score_components,
+        "assigned_risk_pct": round(float(assigned_risk_pct), 4),
+        "actual_risk_pct": round(actual_risk_pct, 4),
+        "was_trimmed": bool(was_trimmed),
+        "portfolio_risk_before": round(float(portfolio_risk_before), 4),
+    }
 
     trade: dict[str, Any] = {
         "strategy": strategy,
@@ -364,11 +751,15 @@ def _open_trade(lab: dict[str, Any], signal: dict[str, Any]) -> dict[str, Any]:
         "position_size_usdt": position_size_usdt,
         "leverage": LEVERAGE,
         "deposit_before": deposit,
-        "entry_reason": signal.get("entry_reason", {}),
+        "entry_reason": entry_reason,
+        "market_regime": regime,
+        "consecutive_losses": consecutive_losses,
+        "day_loss_pct": day_loss_pct,
         "atr": atr,
         "highest_price": entry_price,
         "lowest_price": entry_price,
         "opened_at": now_iso(),
+        **risk_fields,
     }
 
     lab["active_trade"] = trade
@@ -386,14 +777,23 @@ def _open_trade(lab: dict[str, Any], signal: dict[str, Any]) -> dict[str, Any]:
         "position_size_usdt": position_size_usdt,
         "leverage": LEVERAGE,
         "deposit_before": deposit,
-        "entry_reason": signal.get("entry_reason", {}),
+        "entry_reason": entry_reason,
+        "market_regime": regime,
+        "consecutive_losses": consecutive_losses,
+        "day_loss_pct": day_loss_pct,
         "opened_at": trade["opened_at"],
+        **risk_fields,
     })
 
     return lab
 
 
-def _close_trade(lab: dict[str, Any], exit_price: float, reason: str) -> dict[str, Any]:
+def _close_trade(
+    lab: dict[str, Any],
+    exit_price: float,
+    reason: str,
+    notifications: list[str] | None = None,
+) -> dict[str, Any]:
     trade = lab.get("active_trade")
     if not trade:
         return lab
@@ -438,6 +838,14 @@ def _close_trade(lab: dict[str, Any], exit_price: float, reason: str) -> dict[st
         "position_size_usdt": position_size_usdt,
         "leverage": LEVERAGE,
         "entry_reason": trade.get("entry_reason", {}),
+        "market_regime": trade.get("market_regime"),
+        # Carry entry-time score/risk onto the outcome row for offline factor analysis.
+        "score": trade.get("score"),
+        "score_components": trade.get("score_components"),
+        "assigned_risk_pct": trade.get("assigned_risk_pct"),
+        "actual_risk_pct": trade.get("actual_risk_pct"),
+        "was_trimmed": trade.get("was_trimmed"),
+        "portfolio_risk_before": trade.get("portfolio_risk_before"),
         "exit_price": exit_price,
         "exit_reason": reason,
         "pnl_pct": round(pnl_pct, 4),
@@ -448,6 +856,31 @@ def _close_trade(lab: dict[str, Any], exit_price: float, reason: str) -> dict[st
         "opened_at": trade.get("opened_at"),
         "closed_at": closed_at,
     })
+
+    # ── Circuit-breaker bookkeeping ──
+    now = datetime.now(timezone.utc)
+
+    # Consecutive-loss tracking: any profitable trade resets the counter.
+    if pnl_usdt > 0:
+        lab["consecutive_losses"] = 0
+    else:
+        streak = int(lab.get("consecutive_losses") or 0) + 1
+        lab["consecutive_losses"] = streak
+        if streak >= MAX_CONSECUTIVE_LOSSES:
+            until = now + timedelta(hours=COOLDOWN_AFTER_LOSSES_HOURS)
+            lab["losses_cooldown_until"] = until.isoformat()
+            # Reset the counter so the pause grants a fresh streak afterwards.
+            lab["consecutive_losses"] = 0
+            if notifications is not None:
+                notifications.append(
+                    f"⏸ {MAX_CONSECUTIVE_LOSSES} убытка подряд. "
+                    f"Пауза на {COOLDOWN_AFTER_LOSSES_HOURS}ч — рынок неблагоприятный"
+                )
+
+    # Per-symbol stop cooldown after any stop-out / liquidation / emergency exit.
+    if reason in ("stop", "trailing_stop", "liquidation", "pump_guard"):
+        cds = lab.setdefault("stop_cooldowns", {})
+        cds[trade["symbol"]] = (now + timedelta(hours=STOP_COOLDOWN_HOURS)).isoformat()
 
     lab["active_trade"] = None
     return lab
@@ -460,10 +893,17 @@ def futures_tick() -> dict[str, Any]:
     lab = load_futures_state()
     lab["last_tick"] = now_iso()
     lab["last_event"] = None
+    lab = _roll_day(lab)
+    now = datetime.now(timezone.utc)
+    notifications: list[str] = []
 
     if not lab.get("enabled", True):
         save_futures_state(lab)
-        return {"status": "disabled", "virtual_usdt": float(lab.get("virtual_usdt") or 0)}
+        return {
+            "status": "disabled",
+            "virtual_usdt": float(lab.get("virtual_usdt") or 0),
+            "notifications": notifications,
+        }
 
     active = lab.get("active_trade")
 
@@ -474,37 +914,63 @@ def futures_tick() -> dict[str, Any]:
             current_price = float(ticker.get("last") or ticker.get("close") or 0)
         except Exception as exc:
             save_futures_state(lab)
-            return {"status": "error", "error": str(exc)}
+            return {"status": "error", "error": str(exc), "notifications": notifications}
 
         if current_price <= 0:
             save_futures_state(lab)
-            return {"status": "holding", "note": "price=0"}
+            return {"status": "holding", "note": "price=0", "notifications": notifications}
 
         side = active["side"]
         entry_price = float(active["entry_price"])
         atr = float(active.get("atr") or 0)
         position_size_usdt = float(active["position_size_usdt"])
         deposit_before = float(active["deposit_before"])
+        stop_mult = _stop_mult(side)
 
-        # Update trailing stop
+        # ── Pump guard: emergency-exit a short on a sharp 1h pump against us ──
+        if side == "short":
+            try:
+                pump_candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=3)
+                pump_pct = _short_pump_pct(pump_candles, current_price)
+                if pump_pct >= PUMP_GUARD_PCT:
+                    lab = _close_trade(lab, current_price, "pump_guard", notifications)
+                    notifications.append(
+                        f"🚨 Экстренный выход из шорта — памп +{pump_pct:.1f}% за час"
+                    )
+                    save_futures_state(lab)
+                    last = lab["journal"][-1] if lab["journal"] else {}
+                    return {
+                        "status": "closed",
+                        "reason": "pump_guard",
+                        "symbol": symbol,
+                        "pump_pct": round(pump_pct, 2),
+                        "pnl_usdt": last.get("pnl_usdt"),
+                        "virtual_usdt": float(lab["virtual_usdt"]),
+                        "event": lab.get("last_event"),
+                        "notifications": notifications,
+                    }
+            except Exception:
+                pass
+
+        # Update trailing stop (short uses the tighter asymmetric distance)
         if atr > 0:
             if side == "long":
                 highest = max(float(active.get("highest_price") or entry_price), current_price)
                 active["highest_price"] = highest
-                if current_price >= entry_price + ATR_STOP_MULT * atr:
+                if current_price >= entry_price + stop_mult * atr:
                     active["trailing_activated"] = True
                 if active.get("trailing_activated"):
-                    new_trail = highest - ATR_STOP_MULT * atr
+                    new_trail = highest - stop_mult * atr
                     active["trailing_stop"] = max(
                         new_trail, float(active.get("trailing_stop") or active["stop_price"])
                     )
             else:
                 lowest = min(float(active.get("lowest_price") or entry_price), current_price)
                 active["lowest_price"] = lowest
-                if current_price <= entry_price - ATR_STOP_MULT * atr:
+                if current_price <= entry_price - stop_mult * atr:
                     active["trailing_activated"] = True
                 if active.get("trailing_activated"):
-                    new_trail = lowest + ATR_STOP_MULT * atr
+                    new_trail = lowest + stop_mult * atr
                     active["trailing_stop"] = min(
                         new_trail, float(active.get("trailing_stop") or active["stop_price"])
                     )
@@ -520,7 +986,7 @@ def futures_tick() -> dict[str, Any]:
             side == "short" and liq_price > 0 and current_price >= liq_price
         )
         if liq_hit:
-            lab = _close_trade(lab, liq_price, "liquidation")
+            lab = _close_trade(lab, liq_price, "liquidation", notifications)
             save_futures_state(lab)
             last = lab["journal"][-1] if lab["journal"] else {}
             return {
@@ -530,6 +996,7 @@ def futures_tick() -> dict[str, Any]:
                 "pnl_usdt": last.get("pnl_usdt"),
                 "virtual_usdt": float(lab["virtual_usdt"]),
                 "event": lab.get("last_event"),
+                "notifications": notifications,
             }
 
         # Check stop
@@ -538,7 +1005,7 @@ def futures_tick() -> dict[str, Any]:
         )
         if stop_hit:
             reason = "trailing_stop" if active.get("trailing_activated") else "stop"
-            lab = _close_trade(lab, current_price, reason)
+            lab = _close_trade(lab, current_price, reason, notifications)
             save_futures_state(lab)
             last = lab["journal"][-1] if lab["journal"] else {}
             return {
@@ -548,6 +1015,7 @@ def futures_tick() -> dict[str, Any]:
                 "pnl_usdt": last.get("pnl_usdt"),
                 "virtual_usdt": float(lab["virtual_usdt"]),
                 "event": lab.get("last_event"),
+                "notifications": notifications,
             }
 
         # Check take profit
@@ -555,7 +1023,7 @@ def futures_tick() -> dict[str, Any]:
             side == "short" and tp_price > 0 and current_price <= tp_price
         )
         if tp_hit:
-            lab = _close_trade(lab, current_price, "take")
+            lab = _close_trade(lab, current_price, "take", notifications)
             save_futures_state(lab)
             last = lab["journal"][-1] if lab["journal"] else {}
             return {
@@ -565,6 +1033,7 @@ def futures_tick() -> dict[str, Any]:
                 "pnl_usdt": last.get("pnl_usdt"),
                 "virtual_usdt": float(lab["virtual_usdt"]),
                 "event": lab.get("last_event"),
+                "notifications": notifications,
             }
 
         save_futures_state(lab)
@@ -587,24 +1056,93 @@ def futures_tick() -> dict[str, Any]:
             "unrealized_pnl_usdt": round(unrealized_pnl, 2),
             "unrealized_pct": round(unrealized_pnl / deposit_before * 100, 2) if deposit_before else 0,
             "virtual_usdt": float(lab["virtual_usdt"]),
+            "notifications": notifications,
         }
 
-    # No active trade — scan for entry signals
-    signals = _scan_for_signals(exchange)
+    # No active trade — check account-wide circuit breakers before scanning
+    gblock = _global_entry_block(lab, now)
+    if gblock:
+        _log_blocked_entry(lab, "*", "-", "-", "-", gblock)
+        if gblock == "daily_loss_limit" and lab.get("daily_limit_notified_date") != _today_utc():
+            lab["daily_limit_notified_date"] = _today_utc()
+            notifications.append(
+                f"⛔ Дневной лимит убытка достигнут (-{DAILY_LOSS_LIMIT_PCT:.0f}%). "
+                f"Входы остановлены до завтра"
+            )
+        save_futures_state(lab)
+        return {
+            "status": "blocked",
+            "reason": gblock,
+            "day_loss_pct": round(_current_day_loss_pct(lab), 2),
+            "virtual_usdt": float(lab.get("virtual_usdt") or 0),
+            "notifications": notifications,
+        }
 
-    if signals:
-        signal = signals[0]
-        lab = _open_trade(lab, signal)
+    # Scan for entry signals; pick the first that passes per-signal filters
+    signals = _scan_for_signals(exchange)
+    chosen = None
+    blocked: list[dict[str, Any]] = []
+    for sig in signals:
+        sblock = _signal_entry_block(lab, sig, now)
+        if sblock:
+            _log_blocked_entry(
+                lab, sig["symbol"], sig["side"], sig["strategy"], sig.get("regime", "range"), sblock
+            )
+            blocked.append({"symbol": sig["symbol"], "side": sig["side"], "reason": sblock})
+            continue
+        chosen = sig
+        break
+
+    if chosen:
+        portfolio_risk_before = _current_portfolio_risk_pct(lab)
+        actual_risk, assigned_risk, was_trimmed, rblock = _resolve_entry_risk(
+            float(chosen.get("score") or 0), portfolio_risk_before
+        )
+        if rblock:
+            _log_blocked_entry(
+                lab, chosen["symbol"], chosen["side"], chosen["strategy"],
+                chosen.get("regime", "range"), rblock,
+            )
+            if rblock == "portfolio_risk_ceiling":
+                notifications.append(
+                    f"🚧 Портфельный потолок риска исчерпан "
+                    f"({portfolio_risk_before:.2f}% из {MAX_PORTFOLIO_RISK_PCT:.0f}%) — вход заблокирован"
+                )
+            save_futures_state(lab)
+            return {
+                "status": "blocked",
+                "reason": rblock,
+                "symbol": chosen["symbol"],
+                "side": chosen["side"],
+                "portfolio_risk": round(portfolio_risk_before, 2),
+                "virtual_usdt": float(lab.get("virtual_usdt") or 0),
+                "notifications": notifications,
+            }
+
+        lab = _open_trade(
+            lab, chosen, actual_risk, assigned_risk, was_trimmed, portfolio_risk_before
+        )
+        if was_trimmed:
+            notifications.append(
+                f"✂️ Размер урезан с {assigned_risk:.1f}% до {actual_risk:.2f}% "
+                f"из-за потолка риска портфеля ({MAX_PORTFOLIO_RISK_PCT:.0f}%)"
+            )
         save_futures_state(lab)
         return {
             "status": "opened",
-            "strategy": signal["strategy"],
-            "symbol": signal["symbol"],
-            "side": signal["side"],
-            "entry_price": signal["current"],
-            "stop_price": signal["stop_price"],
+            "strategy": chosen["strategy"],
+            "symbol": chosen["symbol"],
+            "side": chosen["side"],
+            "regime": chosen.get("regime"),
+            "score": chosen.get("score"),
+            "assigned_risk_pct": assigned_risk,
+            "actual_risk_pct": actual_risk,
+            "was_trimmed": was_trimmed,
+            "entry_price": chosen["current"],
+            "stop_price": chosen["stop_price"],
             "virtual_usdt": float(lab["virtual_usdt"]),
             "event": lab.get("last_event"),
+            "notifications": notifications,
         }
 
     save_futures_state(lab)
@@ -612,6 +1150,8 @@ def futures_tick() -> dict[str, Any]:
         "status": "idle",
         "virtual_usdt": float(lab.get("virtual_usdt") or 0),
         "signals_checked": len(SYMBOLS) * len(_STRATEGY_FINDERS),
+        "blocked_entries": blocked,
+        "notifications": notifications,
     }
 
 
@@ -653,7 +1193,8 @@ def futures_summary() -> str:
         "📈 FUTURES LAB (виртуальный)",
         "",
         f"Включён: {'да' if lab.get('enabled', True) else 'нет'}",
-        f"Таймфрейм: {TIMEFRAME} | Плечо: {LEVERAGE}x | Риск/сделка: {RISK_PER_TRADE*100:.0f}%",
+        f"Таймфрейм: {TIMEFRAME} | Плечо: {LEVERAGE}x | "
+        f"Риск/сделка: 1-3% по score | Потолок портфеля: {MAX_PORTFOLIO_RISK_PCT:.0f}%",
         f"Пары: {', '.join(SYMBOLS)}",
         f"Депо старт: ${initial:.2f}",
         f"Депо сейчас: ${current:.2f}",
@@ -691,6 +1232,110 @@ def futures_summary() -> str:
         ]
     else:
         lines += ["", "Открытая позиция: нет"]
+
+    return "\n".join(lines)
+
+
+def circuit_status() -> str:
+    """Current state of all circuit breakers."""
+    lab = load_futures_state()
+    lab = _roll_day(lab)
+    save_futures_state(lab)
+
+    now = datetime.now(timezone.utc)
+    day_loss = _current_day_loss_pct(lab)
+    cons = int(lab.get("consecutive_losses") or 0)
+
+    lines = [
+        "🛡 CIRCUIT BREAKERS",
+        "",
+        f"Дневной убыток: -{day_loss:.2f}% из {DAILY_LOSS_LIMIT_PCT:.0f}%"
+        + ("  ⛔ ЛИМИТ" if day_loss >= DAILY_LOSS_LIMIT_PCT else ""),
+        f"Депо на начало дня (UTC {lab.get('day_start_date')}): "
+        f"${float(lab.get('day_start_balance') or 0):.2f}",
+        f"Убытков подряд: {cons} из {MAX_CONSECUTIVE_LOSSES}",
+    ]
+
+    # Cooldowns
+    losses_until = _parse_iso(lab.get("losses_cooldown_until"))
+    if losses_until and now < losses_until:
+        mins = (losses_until - now).total_seconds() / 60
+        lines.append(f"⏸ Пауза после серии убытков: ещё {mins/60:.1f}ч (до {losses_until.isoformat()})")
+    else:
+        lines.append("⏸ Пауза после серии убытков: нет")
+
+    stop_cds = lab.get("stop_cooldowns") or {}
+    active_cds = []
+    for sym, until_s in stop_cds.items():
+        until = _parse_iso(until_s)
+        if until and now < until:
+            mins = (until - now).total_seconds() / 60
+            active_cds.append(f"  {sym}: ещё {mins:.0f}мин")
+    if active_cds:
+        lines.append("🚫 Cooldown после стопа:")
+        lines += active_cds
+    else:
+        lines.append("🚫 Cooldown после стопа: нет")
+
+    # Portfolio risk ceiling
+    deposit = float(lab.get("virtual_usdt") or 0)
+    port_risk = _current_portfolio_risk_pct(lab)
+    remaining = MAX_PORTFOLIO_RISK_PCT - port_risk
+    lines += [
+        "",
+        f"Риск портфеля: {port_risk:.2f}% из {MAX_PORTFOLIO_RISK_PCT:.0f}% "
+        f"(остаток {remaining:.2f}%)",
+    ]
+    positions = _open_positions(lab)
+    if positions:
+        lines.append("Открытые позиции:")
+        for t in positions:
+            r = _position_risk_pct(t, deposit)
+            stop = float(t.get("trailing_stop") or t.get("stop_price") or 0)
+            sc = t.get("score")
+            lines.append(
+                f"  {t.get('symbol')} {t.get('side')} [{t.get('strategy')}] "
+                f"риск {r:.2f}%"
+                + (f" | score {sc}" if sc is not None else "")
+                + f" | вход {t.get('entry_price')} стоп {stop:.2f}"
+                + ("  ✂️" if t.get("was_trimmed") else "")
+            )
+    else:
+        lines.append("Открытые позиции: нет")
+
+    # Live market regimes for the watched symbols
+    lines += ["", "Режим рынка (EMA50 1ч):"]
+    try:
+        exchange = make_futures_exchange()
+        for symbol in SYMBOLS:
+            try:
+                data = _analyze_symbol(exchange, symbol)
+                if not data:
+                    lines.append(f"  {symbol}: нет данных")
+                    continue
+                regime = data.get("regime", "range")
+                long_ok = _entry_allowed_by_regime("long", regime)
+                short_ok = _entry_allowed_by_regime("short", regime)
+                vol_block = " | шорт заблокирован (волатильность)" if data.get("atr_extreme") else ""
+                lines.append(
+                    f"  {symbol}: {regime} "
+                    f"(лонг {'✅' if long_ok else '⛔'} / шорт {'✅' if short_ok and not data.get('atr_extreme') else '⛔'})"
+                    f"{vol_block}"
+                )
+            except Exception as exc:
+                lines.append(f"  {symbol}: ошибка {exc}")
+    except Exception as exc:
+        lines.append(f"  ошибка биржи: {exc}")
+
+    # Recent blocked entries
+    blocked = lab.get("blocked_entries") or []
+    if blocked:
+        lines += ["", f"Последние блокировки входа ({len(blocked)} всего):"]
+        for b in blocked[-5:]:
+            lines.append(
+                f"  {b.get('time', '')[:19]} {b.get('symbol')} "
+                f"{b.get('side')} [{b.get('regime')}] → {b.get('reason')}"
+            )
 
     return "\n".join(lines)
 
@@ -779,6 +1424,9 @@ def export_futures_csv(days: int = 30) -> Path:
 
     fieldnames = [
         "strategy", "side", "symbol",
+        "market_regime", "consecutive_losses", "day_loss_pct",
+        "score", "sc_trend", "sc_magnitude", "sc_regime", "sc_volatility",
+        "assigned_risk_pct", "actual_risk_pct", "was_trimmed", "portfolio_risk_before",
         "entry_price", "stop_price", "take_profit_price", "liquidation_price",
         "position_size_usdt", "leverage",
         "exit_price", "exit_reason",
@@ -794,10 +1442,23 @@ def export_futures_csv(days: int = 30) -> Path:
         writer.writeheader()
         for row in closed:
             er = row.get("entry_reason") or {}
+            sc = row.get("score_components") or {}
             writer.writerow({
                 "strategy": row.get("strategy"),
                 "side": row.get("side"),
                 "symbol": row.get("symbol"),
+                "market_regime": row.get("market_regime"),
+                "consecutive_losses": row.get("consecutive_losses"),
+                "day_loss_pct": row.get("day_loss_pct"),
+                "score": row.get("score"),
+                "sc_trend": sc.get("trend"),
+                "sc_magnitude": sc.get("magnitude"),
+                "sc_regime": sc.get("regime"),
+                "sc_volatility": sc.get("volatility"),
+                "assigned_risk_pct": row.get("assigned_risk_pct"),
+                "actual_risk_pct": row.get("actual_risk_pct"),
+                "was_trimmed": row.get("was_trimmed"),
+                "portfolio_risk_before": row.get("portfolio_risk_before"),
                 "entry_price": row.get("entry_price"),
                 "stop_price": row.get("stop_price"),
                 "take_profit_price": row.get("take_profit_price"),
@@ -848,14 +1509,33 @@ def format_futures_event(event: dict[str, Any] | None) -> str | None:
 
     if action == "OPEN":
         er = event.get("entry_reason") or {}
+        sc = event.get("score_components") or {}
+        score = event.get("score")
+        actual_risk = event.get("actual_risk_pct")
+        assigned_risk = event.get("assigned_risk_pct")
+        risk_line = ""
+        if actual_risk is not None:
+            risk_line = f"Риск: {float(actual_risk):.2f}%"
+            if event.get("was_trimmed"):
+                risk_line += f" (урезан с {float(assigned_risk or 0):.1f}%)"
+            risk_line += "\n"
+        score_line = ""
+        if score is not None:
+            score_line = (
+                f"Score: {score} "
+                f"(тренд {sc.get('trend', '?')}, объём {sc.get('magnitude', '?')}, "
+                f"режим {sc.get('regime', '?')}, волат {sc.get('volatility', '?')})\n"
+            )
         return (
             "📈 FUTURES DEMO ENTRY\n\n"
             f"Пара: {symbol} | {event.get('side', '').upper()}\n"
             f"Стратегия: {event.get('strategy')}\n"
+            f"{score_line}"
             f"Вход: {event.get('entry_price')}\n"
             f"Стоп: {event.get('stop_price')}\n"
             f"TP: {event.get('take_profit_price')}\n"
             f"Лик: {float(event.get('liquidation_price') or 0):.2f}\n"
+            f"{risk_line}"
             f"Позиция: ${float(event.get('position_size_usdt') or 0):.2f} | x{LEVERAGE}\n"
             f"Условие: {er.get('condition', '')}\n"
             f"Депо: ${float(event.get('deposit_before') or 0):.2f}"

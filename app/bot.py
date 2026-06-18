@@ -54,6 +54,7 @@ from app.futures_lab import (
     export_futures_csv,
     futures_reset,
     futures_set_enabled,
+    circuit_status,
 )
 
 PENDING_BUY: dict[int, str] = {}
@@ -1382,6 +1383,18 @@ async def cmd_exportfutures(message: Message):
         await message.answer(f"Ошибка экспорта futures CSV: {exc}")
 
 
+async def cmd_circuitstatus(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        text = await asyncio.to_thread(circuit_status)
+        for chunk in split_text(text):
+            await message.answer(chunk)
+    except Exception as exc:
+        await message.answer(f"Ошибка circuit status: {exc}")
+
+
 async def cmd_rotation(message: Message):
     if not is_allowed(message):
         await message.answer("Нет доступа.")
@@ -1505,6 +1518,7 @@ async def main():
     dp.message.register(cmd_futures, Command("futures"))
     dp.message.register(cmd_futuresreport, Command("futuresreport"))
     dp.message.register(cmd_exportfutures, Command("exportfutures"))
+    dp.message.register(cmd_circuitstatus, Command("circuitstatus"))
 
     # Rotation Lab
     dp.message.register(cmd_rotation, Command("rotation"))

@@ -530,7 +530,7 @@ async def monitor_loop(bot: Bot) -> None:
         f"/ {settings.bybit_portfolio_monitor_minutes} мин.\n"
         f"Rotation Lab demo: каждые {ROTATION_INTERVAL_SECONDS // 60} мин.\n"
         f"Futures Lab demo: каждые {FUTURES_INTERVAL_SECONDS // 60} мин.\n\n"
-        "Команды: /status /scan /positions /bybit /syncbybit /rotation /futures"
+        "Команды: /status /scan /positions /bybit /syncbybit /rotation /futures /circuitstatus"
     )
 
     last_market_scan = 0.0
@@ -577,6 +577,8 @@ async def monitor_loop(bot: Bot) -> None:
                 text = format_futures_event(result.get("event"))
                 if text:
                     await bot.send_message(chat_id, text)
+                for note in result.get("notifications") or []:
+                    await bot.send_message(chat_id, note)
                 last_futures_scan = now
             except Exception as exc:
                 await bot.send_message(chat_id, f"⚠️ Ошибка Futures Lab: {exc}")
