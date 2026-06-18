@@ -14,6 +14,8 @@ from app.storage import get_position, update_portfolio
 from app.formatters import fmt_usdt, fmt_money
 from app.strategy_params import get_tp_levels
 from app.config import CATEGORIES
+from app.error_log import log_error
+from app.spot_journal import log_spot_sell
 from app.market_intelligence import build_market_context
 from app.bybit_portfolio_monitor import check_bybit_portfolio_changes
 from app.rotation_lab import rotation_tick
@@ -31,6 +33,7 @@ TRAILING_TP1_SHARE = 0.40   # доля позиции, которую реком
 MIN_SIGNAL_SCORE = 70       # сигналы ниже этого score не отправляются
 MIN_ENTRY_USDT = 10.0       # минимальный размер транша для нового входа
 SIGNAL_COOLDOWN_SECONDS = 6 * 3600  # кулдаун повторного сигнала по одной монете
+ADVISORY_TP_COOLDOWN_SECONDS = 6 * 3600  # advisory-напоминание о ручной продаже не чаще раза в 6ч
 
 
 def signal_keyboard(coin: str, entry_usdt: float = 0) -> InlineKeyboardMarkup:
@@ -207,7 +210,13 @@ def _scan_positions(state: dict, items: list[dict]) -> tuple[list[str], list[dic
                 f"Рекомендация системы: частичная фиксация прибыли."
             )
 
-        # --- Трейлинг стоп ---
+        # --- Трейлинг стоп: ТОЛЬКО детекция ---
+        # C1/C2: здесь НЕ меняем qty/invested_usdt, НЕ ставим постоянных флагов
+        # (trailing_tp1_done/trailing_active) и НЕ пишем в журнал. Любое изменение
+        # денежного состояния и запись в журнал — только ПОСЛЕ подтверждённого
+        # ордера, в monitor_loop → _process_sell_action → _apply_confirmed_sell.
+        # Допустимо лишь безопасное обновление трейлинг-максимума (не денежная
+        # операция), и только когда трейлинг уже активирован (после реальной TP1).
         if avg and qty > 0:
             item_data = item_map.get(coin, {})
             # 1h ATR аппроксимация: ATR_1d / sqrt(24)
@@ -218,53 +227,25 @@ def _scan_positions(state: dict, items: list[dict]) -> tuple[list[str], list[dic
             trailing_active = pos.get("trailing_active", False)
 
             if not trailing_tp1_done and price >= avg * (1 + TRAILING_TP1_PCT / 100):
-                qty_sell_40 = qty * TRAILING_TP1_SHARE
-                pnl_usdt_40 = qty_sell_40 * (price - avg)
-                initial_stop = price - atr_1h_price
-
-                pos["trailing_tp1_done"] = True
-                pos["tp1_done"] = True
-                pos["trailing_active"] = True
-                pos["trailing_max"] = price
-                pos["trailing_stop"] = round(initial_stop, 8)
-                pos["trailing_tp1_price"] = price
-
-                try:
-                    from app.spot_journal import log_spot_sell as _log_sell
-                    _log_sell(
-                        symbol=coin,
-                        exit_type="TP1",
-                        entry_price_avg=avg,
-                        exit_price=price,
-                        qty_sold=qty_sell_40,
-                        pnl_pct=pnl_pct,
-                        pnl_usdt=pnl_usdt_40,
-                        hold_hours=_hold_hours_from_pos(pos),
-                        trailing_max_price=price,
-                        exit_reason=f"TP1 +{TRAILING_TP1_PCT:.0f}% от средней — зафиксировать 40%",
-                    )
-                except Exception:
-                    pass
-
-                pending_executions.append({
-                    "type": "TP1",
-                    "coin": coin,
-                    "qty_sell": qty_sell_40,
-                    "avg": avg,
-                    "price": price,
-                    "pnl_pct": pnl_pct,
-                    "pnl_usdt": pnl_usdt_40,
-                    "trailing_stop": round(initial_stop, 8),
-                })
-                messages.append(
-                    f"🟢 ТРЕЙЛИНГ TP1 +{TRAILING_TP1_PCT:.0f}% — {coin}\n"
-                    f"Средняя цена: {fmt_usdt(avg)} USDT | Цена: {fmt_usdt(price)} USDT\n"
-                    f"PnL: {pnl_pct:+.2f}% / {fmt_money(pnl_usdt_40)}\n"
-                    f"Трейлинг активирован на оставшиеся 60%\n"
-                    f"Трейлинг стоп: {fmt_usdt(initial_stop)} USDT"
-                )
+                # В advisory режиме не спамим: эмитим намерение не чаще кулдауна.
+                emit = settings.tp_auto_execute or not _advisory_on_cooldown(pos, "TP1")
+                if emit:
+                    qty_sell_40 = qty * TRAILING_TP1_SHARE
+                    pending_executions.append({
+                        "type": "TP1",
+                        "coin": coin,
+                        "share": TRAILING_TP1_SHARE,
+                        "qty_sell": qty_sell_40,
+                        "avg": avg,
+                        "price": price,
+                        "pnl_pct": pnl_pct,
+                        "pnl_usdt": qty_sell_40 * (price - avg),
+                        "proposed_trailing_stop": round(price - atr_1h_price, 8),
+                        "hold_hours": _hold_hours_from_pos(pos),
+                    })
 
             elif trailing_active:
+                # Обновление high-water mark — безопасно (не денежная операция).
                 trailing_max = float(pos.get("trailing_max", price))
                 trailing_stop_val = float(pos.get("trailing_stop", price * 0.97))
 
@@ -277,87 +258,232 @@ def _scan_positions(state: dict, items: list[dict]) -> tuple[list[str], list[dic
 
                 if price <= trailing_stop_val:
                     qty_remaining = qty * (1 - TRAILING_TP1_SHARE)
-                    pnl_usdt_trail = qty_remaining * (price - avg)
                     pnl_from_avg = (price / avg - 1) * 100 if avg else 0
-
-                    pos["trailing_active"] = False
-                    pos["trailing_triggered"] = True
-
-                    try:
-                        from app.spot_journal import log_spot_sell as _log_sell
-                        _log_sell(
-                            symbol=coin,
-                            exit_type="trailing",
-                            entry_price_avg=avg,
-                            exit_price=price,
-                            qty_sold=qty_remaining,
-                            pnl_pct=pnl_from_avg,
-                            pnl_usdt=pnl_usdt_trail,
-                            hold_hours=_hold_hours_from_pos(pos),
-                            trailing_max_price=trailing_max,
-                            exit_reason=f"Трейлинг {fmt_usdt(trailing_stop_val)} USDT достигнут",
-                        )
-                    except Exception:
-                        pass
-
                     pending_executions.append({
                         "type": "trailing",
                         "coin": coin,
+                        "share": 1 - TRAILING_TP1_SHARE,
                         "qty_sell": qty_remaining,
                         "avg": avg,
                         "price": price,
                         "pnl_pct": pnl_from_avg,
-                        "pnl_usdt": pnl_usdt_trail,
+                        "pnl_usdt": qty_remaining * (price - avg),
                         "trailing_max": trailing_max,
                         "trailing_stop": trailing_stop_val,
+                        "hold_hours": _hold_hours_from_pos(pos),
                     })
-                    messages.append(
-                        f"🔴 Трейлинг сработал — {coin}\n"
-                        f"Стоп: {fmt_usdt(trailing_stop_val)} USDT | Цена: {fmt_usdt(price)} USDT\n"
-                        f"Итог: {pnl_from_avg:+.2f}% от средней {fmt_usdt(avg)} USDT\n"
-                        f"Максимум за удержание: {fmt_usdt(trailing_max)} USDT"
-                    )
 
         positions[coin] = pos
 
     return messages, pending_executions
 
 
-def _format_tp_exec_notification(exec_info: dict, result: dict) -> str:
-    """Format Telegram notification after a TP market sell attempt."""
-    coin = exec_info["coin"]
-    exec_type = exec_info["type"]
-    qty = exec_info["qty_sell"]
-    avg = exec_info["avg"]
+def _action_label(action: dict) -> str:
+    return "TP1" if action.get("type") == "TP1" else "Трейлинг"
 
-    if exec_type == "TP1":
-        label = "TP1"
-        share_label = "40%"
-    else:
-        label = "Трейлинг"
-        share_label = "60%"
 
-    if result.get("ok"):
-        exec_price = float(result.get("price") or exec_info.get("price", 0))
-        qty_done = float(result.get("qty_executed") or qty)
-        pnl_usdt = qty_done * (exec_price - avg) if avg and exec_price else exec_info.get("pnl_usdt", 0)
-        pnl_pct = (exec_price / avg - 1) * 100 if avg and exec_price else exec_info.get("pnl_pct", 0)
-        msg = (
-            f"✅ {label} исполнен — {coin}\n"
-            f"Продано {share_label} по ${fmt_usdt(exec_price)}\n"
-            f"PnL: {fmt_money(pnl_usdt)} ({pnl_pct:+.1f}%)"
+def _share_label(action: dict) -> str:
+    return f"{int(round(float(action.get('share') or 0) * 100))}%"
+
+
+def _exit_reason(action: dict) -> str:
+    if action.get("type") == "TP1":
+        return f"TP1 +{TRAILING_TP1_PCT:.0f}% от средней — зафиксировано {_share_label(action)}"
+    return f"Трейлинг {fmt_usdt(action.get('trailing_stop') or 0)} USDT достигнут"
+
+
+def _advisory_on_cooldown(pos: dict, action_type: str) -> bool:
+    """True если advisory-напоминание этого типа отправлялось недавно.
+
+    Используем кулдаун-таймстемп вместо постоянного флага: проверка TP никогда
+    не отключается навсегда, просто не повторяется чаще раза в N часов.
+    """
+    cds = pos.get("advisory_cooldowns") or {}
+    ts = cds.get(action_type)
+    if not ts:
+        return False
+    try:
+        elapsed = (datetime.now() - datetime.fromisoformat(ts)).total_seconds()
+        return elapsed < ADVISORY_TP_COOLDOWN_SECONDS
+    except Exception:
+        return False
+
+
+def _apply_advisory_cooldown(coin: str, action_type: str) -> None:
+    """Отметить, что advisory-напоминание отправлено (ставит таймстемп, не флаг)."""
+    def _mut(state: dict) -> None:
+        pos = (state.get("positions") or {}).get(coin)
+        if not pos:
+            return
+        pos.setdefault("advisory_cooldowns", {})[action_type] = datetime.now().isoformat(timespec="seconds")
+    update_portfolio(_mut)
+
+
+def _apply_confirmed_sell(coin: str, action: dict, exec_price: float, qty_done: float) -> dict | None:
+    """Атомарно уменьшить позицию на ФАКТИЧЕСКИ проданный объём и выставить флаги.
+
+    Вызывается ТОЛЬКО после ok=True от биржи. Возвращает обновлённый pos,
+    {"closed": True} если позиция закрыта, либо None если позиции уже нет.
+    """
+    captured: dict = {}
+
+    def _mut(state: dict) -> None:
+        positions = state.setdefault("positions", {})
+        pos = positions.get(coin)
+        if not pos:
+            captured["pos"] = None
+            return
+
+        old_qty = float(pos.get("qty", 0))
+        sell_qty = min(float(qty_done), old_qty) if old_qty > 0 else 0.0
+        share = sell_qty / old_qty if old_qty > 0 else 0.0
+        cost = float(pos.get("invested_usdt", 0)) * share
+
+        pos["qty"] = old_qty - sell_qty
+        pos["invested_usdt"] = float(pos.get("invested_usdt", 0)) - cost
+        # Средняя цена входа при продаже не меняется (cost basis на единицу тот же);
+        # пересчитываем из остатка для согласованности.
+        pos["avg_price"] = (
+            pos["invested_usdt"] / pos["qty"] if pos["qty"] > 1e-12 else float(pos.get("avg_price", 0))
         )
-        if exec_type == "TP1":
-            trailing_stop = exec_info.get("trailing_stop", 0)
-            msg += f"\nОстаток на трейлинге, стоп ${fmt_usdt(trailing_stop)}"
-        return msg
+
+        if action.get("type") == "TP1":
+            pos["trailing_tp1_done"] = True
+            pos["tp1_done"] = True
+            pos["trailing_active"] = True
+            pos["trailing_max"] = exec_price
+            pos["trailing_stop"] = float(action.get("proposed_trailing_stop") or 0)
+            pos["trailing_tp1_price"] = exec_price
+        else:  # trailing — закрываем остаток
+            pos["trailing_active"] = False
+            pos["trailing_triggered"] = True
+
+        if pos["qty"] <= 1e-12:
+            positions.pop(coin, None)
+            captured["pos"] = {"closed": True}
+        else:
+            positions[coin] = pos
+            captured["pos"] = pos
+
+    update_portfolio(_mut)
+    return captured.get("pos")
+
+
+def _reconcile_after_sell(coin: str) -> None:
+    """TODO (H1+H2): после успешной продажи сверить локальный остаток с реальным
+    балансом Bybit, который должен быть источником истины по qty при включённой
+    реальной торговле. Пока заглушка — полная реализация в H1+H2."""
+    return None
+
+
+def _advisory_sell_message(action: dict) -> str:
+    coin = action["coin"]
+    head = (
+        f"🟢 TP1 +{TRAILING_TP1_PCT:.0f}% — {coin}"
+        if action.get("type") == "TP1"
+        else f"🔴 Трейлинг — {coin}"
+    )
+    return (
+        f"{head} (advisory)\n"
+        f"Рекомендация: продать {_share_label(action)} вручную на Bybit\n"
+        f"Средняя: {fmt_usdt(action['avg'])} USDT | Цена: {fmt_usdt(action['price'])} USDT\n"
+        f"PnL: {float(action.get('pnl_pct') or 0):+.2f}% / {fmt_money(action.get('pnl_usdt') or 0)}\n"
+        f"≈ {float(action['qty_sell']):.6f} {coin}\n"
+        f"Автоторговля выключена — позиция НЕ изменена. "
+        f"Повтор не раньше чем через {ADVISORY_TP_COOLDOWN_SECONDS // 3600}ч."
+    )
+
+
+def _confirmed_sell_message(action: dict, exec_price: float, qty_done: float) -> str:
+    avg = float(action.get("avg") or 0)
+    pnl_usdt = qty_done * (exec_price - avg) if avg else 0.0
+    pnl_pct = (exec_price / avg - 1) * 100 if avg else 0.0
+    msg = (
+        f"✅ {_action_label(action)} исполнен — {action['coin']}\n"
+        f"Продано {_share_label(action)} по ${fmt_usdt(exec_price)} ({qty_done:.6f} {action['coin']})\n"
+        f"PnL: {fmt_money(pnl_usdt)} ({pnl_pct:+.1f}%)"
+    )
+    if action.get("type") == "TP1":
+        msg += f"\nОстаток на трейлинге, стоп ${fmt_usdt(action.get('proposed_trailing_stop') or 0)}"
     else:
-        error = result.get("error") or "неизвестная ошибка"
-        return (
-            f"⚠️ {label} не исполнен — {coin}\n"
-            f"Ошибка: {error}\n"
-            f"Закрой вручную по рынку на Bybit ({share_label} позиции ~{qty:.6f} {coin})"
+        msg += "\nПозиция закрыта."
+    return msg
+
+
+def _failed_sell_message(action: dict, result: dict) -> str:
+    return (
+        f"⚠️ {_action_label(action)} НЕ исполнен — {action['coin']}\n"
+        f"Ошибка: {result.get('error') or 'неизвестная ошибка'}\n"
+        f"Позиция НЕ изменена, проверь вручную.\n"
+        f"Можно закрыть {_share_label(action)} (~{float(action['qty_sell']):.6f} {action['coin']}) "
+        f"по рынку на Bybit."
+    )
+
+
+async def _process_sell_action(bot: Bot, chat_id: int, action: dict) -> None:
+    """Денежная цепочка одной продажи (TP1/трейлинг).
+
+    advisory: уведомить и поставить кулдаун, состояние НЕ трогать.
+    auto: ордер → ТОЛЬКО при ok=True менять состояние/журнал; при ok=False —
+    error_log + предупреждение, состояние не меняется.
+    """
+    coin = action["coin"]
+
+    if not settings.tp_auto_execute:
+        await bot.send_message(chat_id, _advisory_sell_message(action))
+        try:
+            _apply_advisory_cooldown(coin, action["type"])
+        except Exception as exc:
+            log_error("monitor.advisory_cooldown", exc, {"coin": coin, "type": action.get("type")})
+        return
+
+    from app.bybit_executor import execute_market_sell
+    result = await asyncio.to_thread(
+        execute_market_sell, coin, action["qty_sell"], action["type"]
+    )
+
+    if not result.get("ok"):
+        log_error(
+            "monitor.tp_execute",
+            RuntimeError(result.get("error") or "order failed"),
+            {"coin": coin, "type": action.get("type"), "qty_sell": action.get("qty_sell"), "result": result},
         )
+        await bot.send_message(chat_id, _failed_sell_message(action, result))
+        return
+
+    # ok=True — фактические цифры из ответа Bybit
+    exec_price = float(result.get("price") or action["price"])
+    qty_done = float(result.get("qty_executed") or action["qty_sell"])
+
+    applied = _apply_confirmed_sell(coin, action, exec_price, qty_done)
+    if applied is None:
+        log_error(
+            "monitor.tp_apply",
+            RuntimeError("position missing when applying confirmed sell"),
+            {"coin": coin, "type": action.get("type")},
+        )
+
+    # Журнал — ФАКТИЧЕСКИЕ цифры, только после подтверждения ордера
+    try:
+        log_spot_sell(
+            symbol=coin,
+            exit_type=action["type"],
+            entry_price_avg=float(action.get("avg") or 0),
+            exit_price=exec_price,
+            qty_sold=qty_done,
+            pnl_pct=(exec_price / action["avg"] - 1) * 100 if action.get("avg") else 0.0,
+            pnl_usdt=qty_done * (exec_price - action["avg"]) if action.get("avg") else 0.0,
+            hold_hours=float(action.get("hold_hours") or 0.0),
+            trailing_max_price=action.get("trailing_max") or action.get("price"),
+            exit_reason=_exit_reason(action),
+        )
+    except Exception as exc:
+        log_error("monitor.spot_journal", exc, {"coin": coin, "type": action.get("type")})
+
+    await bot.send_message(chat_id, _confirmed_sell_message(action, exec_price, qty_done))
+
+    # Источник истины по qty при реальной торговле — баланс Bybit (H1+H2).
+    _reconcile_after_sell(coin)
 
 
 def format_rotation_event(result: dict) -> str | None:
@@ -468,16 +594,8 @@ async def monitor_loop(bot: Bot) -> None:
                 alert_msgs, pending_execs = build_position_alerts(items)
                 for text in alert_msgs:
                     await bot.send_message(chat_id, text)
-                for exec_info in pending_execs:
-                    from app.bybit_executor import execute_market_sell
-                    result = await asyncio.to_thread(
-                        execute_market_sell,
-                        exec_info["coin"],
-                        exec_info["qty_sell"],
-                        exec_info["type"],
-                    )
-                    notification = _format_tp_exec_notification(exec_info, result)
-                    await bot.send_message(chat_id, notification)
+                for action in pending_execs:
+                    await _process_sell_action(bot, chat_id, action)
                 last_market_scan = now
             except Exception as exc:
                 await bot.send_message(chat_id, f"⚠️ Ошибка автомониторинга: {exc}")
