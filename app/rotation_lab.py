@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from app.market import make_exchange
-from app.storage import load_portfolio, save_portfolio
+from app.storage import load_portfolio, update_portfolio
 
 
 ROTATION_KEY = "rotation_lab"
@@ -119,8 +119,8 @@ def load_rotation_state() -> dict[str, Any]:
 
     if not lab:
         lab = default_rotation_state()
-        state[ROTATION_KEY] = lab
-        save_portfolio(state)
+        # Only touch our own key so we never clobber positions/futures_lab.
+        update_portfolio(lambda s: s.update({ROTATION_KEY: lab}))
         return lab
 
     lab.setdefault("enabled", True)
@@ -140,10 +140,10 @@ def load_rotation_state() -> dict[str, Any]:
 
 
 def save_rotation_state(lab: dict[str, Any]) -> None:
-    state = load_portfolio()
     lab["updated_at"] = now_iso()
-    state[ROTATION_KEY] = lab
-    save_portfolio(state)
+    # Atomic, key-scoped write: re-reads fresh state under the portfolio lock and
+    # only replaces ROTATION_KEY, preserving positions and other labs' keys.
+    update_portfolio(lambda s: s.update({ROTATION_KEY: lab}))
 
 
 def fetch_pair_price(exchange, pair: str) -> float:
@@ -518,9 +518,8 @@ def rotation_set_enabled(enabled: bool) -> str:
 
 
 def rotation_reset() -> str:
-    state = load_portfolio()
-    state[ROTATION_KEY] = default_rotation_state()
-    save_portfolio(state)
+    fresh = default_rotation_state()
+    update_portfolio(lambda s: s.update({ROTATION_KEY: fresh}))
     return "🧪 Rotation Lab сброшен. Виртуальный баланс снова 1.00000000 BTC"
 
 

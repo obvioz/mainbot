@@ -10,7 +10,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from app.market import analyze_market, make_exchange, fetch_ohlcv_df
 from app.signals import classify_signal, format_compact_signal, format_core_signal
 from app.settings import settings
-from app.storage import load_portfolio, save_portfolio
+from app.storage import get_position, update_portfolio
 from app.formatters import fmt_usdt, fmt_money
 from app.strategy_params import get_tp_levels
 from app.config import CATEGORIES
@@ -24,6 +24,13 @@ SIGNAL_STATUSES = {"STRONG_BUY", "ACCUMULATION"}
 
 ROTATION_INTERVAL_SECONDS = 5 * 60
 FUTURES_INTERVAL_SECONDS = 5 * 60
+
+TRAILING_TP1_PCT = 9.0      # % роста от средней для активации трейлинга
+TRAILING_TP1_SHARE = 0.40   # доля позиции, которую рекомендуем закрыть на TP1
+
+MIN_SIGNAL_SCORE = 70       # сигналы ниже этого score не отправляются
+MIN_ENTRY_USDT = 10.0       # минимальный размер транша для нового входа
+SIGNAL_COOLDOWN_SECONDS = 6 * 3600  # кулдаун повторного сигнала по одной монете
 
 
 def signal_keyboard(coin: str, entry_usdt: float = 0) -> InlineKeyboardMarkup:
@@ -65,6 +72,7 @@ def build_monitor_signals(items: list[dict], market_context: dict | None = None)
     if market_context is None:
         market_context = build_market_context(items)
     state = load_state()
+    now_ts = time.time()
     messages: list[tuple[str, str, float]] = []
 
     for item in items:
@@ -76,11 +84,28 @@ def build_monitor_signals(items: list[dict], market_context: dict | None = None)
         if status not in SIGNAL_STATUSES:
             state.pop(f"signal_{coin}", None)
             continue
-        key = signal_key(item, signal)
-        if state.get(f"signal_{coin}") == key:
+
+        # Фильтр слабых сигналов (БАГ 2)
+        score = int(signal.get("score", 0))
+        if score < MIN_SIGNAL_SCORE:
+            state.pop(f"signal_{coin}", None)
             continue
-        state[f"signal_{coin}"] = key
+
         entry_usdt = float(signal.get("entry_usdt") or 0)
+
+        # Фильтр малого транша для новых входов (БАГ 1)
+        pos = get_position(coin)
+        if not pos and entry_usdt < MIN_ENTRY_USDT:
+            state.pop(f"signal_{coin}", None)
+            continue
+
+        # Дедупликация: один сигнал по монете не чаще раза в 6 часов
+        prev = state.get(f"signal_{coin}")
+        if isinstance(prev, dict):
+            if now_ts - prev.get("sent_at", 0) < SIGNAL_COOLDOWN_SECONDS:
+                continue
+        state[f"signal_{coin}"] = {"key": signal_key(item, signal), "sent_at": now_ts}
+
         if coin in CORE_COINS:
             text = format_core_signal(item, signal)
         else:
@@ -92,12 +117,43 @@ def build_monitor_signals(items: list[dict], market_context: dict | None = None)
     return messages
 
 
-def build_position_alerts(items: list[dict]) -> list[str]:
+def _hold_hours_from_pos(pos: dict) -> float:
+    """Estimate how many hours the position has been open from first entry date."""
+    entries = pos.get("entries") or []
+    if not entries:
+        return 0.0
+    first_ts = entries[0].get("date", "")
+    if not first_ts:
+        return 0.0
+    try:
+        first_dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+        now = datetime.now(first_dt.tzinfo)
+        return (now - first_dt).total_seconds() / 3600.0
+    except Exception:
+        return 0.0
+
+
+def build_position_alerts(items: list[dict]) -> tuple[list[str], list[dict]]:
+    """Scan open positions for DCA/TP/trailing triggers.
+
+    Returns (messages, pending_executions).
+    pending_executions — list of dicts describing sells to execute via Bybit:
+        {type, coin, qty_sell, avg, price, pnl_pct, pnl_usdt, trailing_stop}
+
+    The scan mutates portfolio_state.json (TP flags, trailing stops), so it runs
+    inside update_portfolio() — an atomic read-modify-write under the global
+    portfolio lock that prevents concurrent writers from clobbering each other.
+    """
+    return update_portfolio(lambda state: _scan_positions(state, items))
+
+
+def _scan_positions(state: dict, items: list[dict]) -> tuple[list[str], list[dict]]:
     price_map = {x["coin"]: float(x["current"]) for x in items if "error" not in x}
-    state = load_portfolio()
+    item_map = {x["coin"]: x for x in items if "error" not in x}
     positions = state.get("positions", {})
     alerts = state.setdefault("alerts", {})
-    messages = []
+    messages: list[str] = []
+    pending_executions: list[dict] = []
 
     for coin, pos in list(positions.items()):
         if coin not in price_map:
@@ -151,10 +207,157 @@ def build_position_alerts(items: list[dict]) -> list[str]:
                 f"Рекомендация системы: частичная фиксация прибыли."
             )
 
+        # --- Трейлинг стоп ---
+        if avg and qty > 0:
+            item_data = item_map.get(coin, {})
+            # 1h ATR аппроксимация: ATR_1d / sqrt(24)
+            atr_pct_1d = float(item_data.get("atr_pct", 2.0))
+            atr_1h_price = price * (atr_pct_1d / 100.0) / (24 ** 0.5)
+
+            trailing_tp1_done = pos.get("trailing_tp1_done", False)
+            trailing_active = pos.get("trailing_active", False)
+
+            if not trailing_tp1_done and price >= avg * (1 + TRAILING_TP1_PCT / 100):
+                qty_sell_40 = qty * TRAILING_TP1_SHARE
+                pnl_usdt_40 = qty_sell_40 * (price - avg)
+                initial_stop = price - atr_1h_price
+
+                pos["trailing_tp1_done"] = True
+                pos["tp1_done"] = True
+                pos["trailing_active"] = True
+                pos["trailing_max"] = price
+                pos["trailing_stop"] = round(initial_stop, 8)
+                pos["trailing_tp1_price"] = price
+
+                try:
+                    from app.spot_journal import log_spot_sell as _log_sell
+                    _log_sell(
+                        symbol=coin,
+                        exit_type="TP1",
+                        entry_price_avg=avg,
+                        exit_price=price,
+                        qty_sold=qty_sell_40,
+                        pnl_pct=pnl_pct,
+                        pnl_usdt=pnl_usdt_40,
+                        hold_hours=_hold_hours_from_pos(pos),
+                        trailing_max_price=price,
+                        exit_reason=f"TP1 +{TRAILING_TP1_PCT:.0f}% от средней — зафиксировать 40%",
+                    )
+                except Exception:
+                    pass
+
+                pending_executions.append({
+                    "type": "TP1",
+                    "coin": coin,
+                    "qty_sell": qty_sell_40,
+                    "avg": avg,
+                    "price": price,
+                    "pnl_pct": pnl_pct,
+                    "pnl_usdt": pnl_usdt_40,
+                    "trailing_stop": round(initial_stop, 8),
+                })
+                messages.append(
+                    f"🟢 ТРЕЙЛИНГ TP1 +{TRAILING_TP1_PCT:.0f}% — {coin}\n"
+                    f"Средняя цена: {fmt_usdt(avg)} USDT | Цена: {fmt_usdt(price)} USDT\n"
+                    f"PnL: {pnl_pct:+.2f}% / {fmt_money(pnl_usdt_40)}\n"
+                    f"Трейлинг активирован на оставшиеся 60%\n"
+                    f"Трейлинг стоп: {fmt_usdt(initial_stop)} USDT"
+                )
+
+            elif trailing_active:
+                trailing_max = float(pos.get("trailing_max", price))
+                trailing_stop_val = float(pos.get("trailing_stop", price * 0.97))
+
+                if price > trailing_max:
+                    new_stop = price - atr_1h_price
+                    trailing_stop_val = max(trailing_stop_val, new_stop)
+                    trailing_max = price
+                    pos["trailing_max"] = trailing_max
+                    pos["trailing_stop"] = round(trailing_stop_val, 8)
+
+                if price <= trailing_stop_val:
+                    qty_remaining = qty * (1 - TRAILING_TP1_SHARE)
+                    pnl_usdt_trail = qty_remaining * (price - avg)
+                    pnl_from_avg = (price / avg - 1) * 100 if avg else 0
+
+                    pos["trailing_active"] = False
+                    pos["trailing_triggered"] = True
+
+                    try:
+                        from app.spot_journal import log_spot_sell as _log_sell
+                        _log_sell(
+                            symbol=coin,
+                            exit_type="trailing",
+                            entry_price_avg=avg,
+                            exit_price=price,
+                            qty_sold=qty_remaining,
+                            pnl_pct=pnl_from_avg,
+                            pnl_usdt=pnl_usdt_trail,
+                            hold_hours=_hold_hours_from_pos(pos),
+                            trailing_max_price=trailing_max,
+                            exit_reason=f"Трейлинг {fmt_usdt(trailing_stop_val)} USDT достигнут",
+                        )
+                    except Exception:
+                        pass
+
+                    pending_executions.append({
+                        "type": "trailing",
+                        "coin": coin,
+                        "qty_sell": qty_remaining,
+                        "avg": avg,
+                        "price": price,
+                        "pnl_pct": pnl_from_avg,
+                        "pnl_usdt": pnl_usdt_trail,
+                        "trailing_max": trailing_max,
+                        "trailing_stop": trailing_stop_val,
+                    })
+                    messages.append(
+                        f"🔴 Трейлинг сработал — {coin}\n"
+                        f"Стоп: {fmt_usdt(trailing_stop_val)} USDT | Цена: {fmt_usdt(price)} USDT\n"
+                        f"Итог: {pnl_from_avg:+.2f}% от средней {fmt_usdt(avg)} USDT\n"
+                        f"Максимум за удержание: {fmt_usdt(trailing_max)} USDT"
+                    )
+
         positions[coin] = pos
 
-    save_portfolio(state)
-    return messages
+    return messages, pending_executions
+
+
+def _format_tp_exec_notification(exec_info: dict, result: dict) -> str:
+    """Format Telegram notification after a TP market sell attempt."""
+    coin = exec_info["coin"]
+    exec_type = exec_info["type"]
+    qty = exec_info["qty_sell"]
+    avg = exec_info["avg"]
+
+    if exec_type == "TP1":
+        label = "TP1"
+        share_label = "40%"
+    else:
+        label = "Трейлинг"
+        share_label = "60%"
+
+    if result.get("ok"):
+        exec_price = float(result.get("price") or exec_info.get("price", 0))
+        qty_done = float(result.get("qty_executed") or qty)
+        pnl_usdt = qty_done * (exec_price - avg) if avg and exec_price else exec_info.get("pnl_usdt", 0)
+        pnl_pct = (exec_price / avg - 1) * 100 if avg and exec_price else exec_info.get("pnl_pct", 0)
+        msg = (
+            f"✅ {label} исполнен — {coin}\n"
+            f"Продано {share_label} по ${fmt_usdt(exec_price)}\n"
+            f"PnL: {fmt_money(pnl_usdt)} ({pnl_pct:+.1f}%)"
+        )
+        if exec_type == "TP1":
+            trailing_stop = exec_info.get("trailing_stop", 0)
+            msg += f"\nОстаток на трейлинге, стоп ${fmt_usdt(trailing_stop)}"
+        return msg
+    else:
+        error = result.get("error") or "неизвестная ошибка"
+        return (
+            f"⚠️ {label} не исполнен — {coin}\n"
+            f"Ошибка: {error}\n"
+            f"Закрой вручную по рынку на Bybit ({share_label} позиции ~{qty:.6f} {coin})"
+        )
 
 
 def format_rotation_event(result: dict) -> str | None:
@@ -262,8 +465,19 @@ async def monitor_loop(bot: Bot) -> None:
                 for text, coin, entry_usdt in signal_messages:
                     kb = signal_keyboard(coin, entry_usdt) if coin not in CORE_COINS else None
                     await bot.send_message(chat_id, text, reply_markup=kb)
-                for text in build_position_alerts(items):
+                alert_msgs, pending_execs = build_position_alerts(items)
+                for text in alert_msgs:
                     await bot.send_message(chat_id, text)
+                for exec_info in pending_execs:
+                    from app.bybit_executor import execute_market_sell
+                    result = await asyncio.to_thread(
+                        execute_market_sell,
+                        exec_info["coin"],
+                        exec_info["qty_sell"],
+                        exec_info["type"],
+                    )
+                    notification = _format_tp_exec_notification(exec_info, result)
+                    await bot.send_message(chat_id, notification)
                 last_market_scan = now
             except Exception as exc:
                 await bot.send_message(chat_id, f"⚠️ Ошибка автомониторинга: {exc}")

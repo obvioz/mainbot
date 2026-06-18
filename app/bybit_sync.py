@@ -12,7 +12,7 @@ from app.strategy_params import get_tp_levels
 from app.config import COINS, TAKE_PROFIT_LEVELS, CATEGORIES, normalize_coin
 from app.market import make_exchange, analyze_coin
 from app.formatters import fmt_money, fmt_usdt
-from app.storage import get_open_positions, save_portfolio, load_portfolio, add_journal, now_iso
+from app.storage import get_open_positions, update_portfolio, add_journal, now_iso
 
 
 @dataclass
@@ -371,7 +371,26 @@ def sync_bybit_to_local() -> dict:
     Does not trade. It only updates local data/portfolio.json so DCA/TP can work from real holdings.
     """
     assets, quote_balance = build_bybit_assets()
-    state = load_portfolio()
+    # Atomic read-modify-write: only positions + sync metadata are replaced, so
+    # concurrent lab writers (futures_lab/rotation_lab) keep their own keys.
+    synced, skipped = update_portfolio(
+        lambda state: _apply_bybit_sync(state, assets, quote_balance)
+    )
+
+    add_journal({
+        "action": "SYNC_BYBIT",
+        "coin": "PORTFOLIO",
+        "price": 0,
+        "amount_usdt": 0,
+        "qty": 0,
+        "reason": f"synced={','.join(synced)} skipped={','.join(x['coin'] for x in skipped)}",
+    })
+    return {"synced": synced, "skipped": skipped, "quote_balance": quote_balance}
+
+
+def _apply_bybit_sync(state: dict, assets, quote_balance) -> tuple[list, list]:
+    """Rebuild local positions from Bybit reality. Mutates ``state`` in place and
+    returns (synced, skipped). Runs inside update_portfolio under the lock."""
     positions = {}
     synced = []
     skipped = []
@@ -420,14 +439,4 @@ def sync_bybit_to_local() -> dict:
     state["positions"] = positions
     state["bybit_quote_balance"] = quote_balance
     state["last_bybit_sync"] = now_iso()
-    save_portfolio(state)
-
-    add_journal({
-        "action": "SYNC_BYBIT",
-        "coin": "PORTFOLIO",
-        "price": 0,
-        "amount_usdt": 0,
-        "qty": 0,
-        "reason": f"synced={','.join(synced)} skipped={','.join(x['coin'] for x in skipped)}",
-    })
-    return {"synced": synced, "skipped": skipped, "quote_balance": quote_balance}
+    return synced, skipped
