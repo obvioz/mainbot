@@ -30,4 +30,11 @@ class Settings:
     save_market_snapshots: bool = os.getenv("SAVE_MARKET_SNAPSHOTS", "true").lower() in {"1", "true", "yes", "y", "да"}
     bybit_time_safety_ms: int = int(os.getenv("BYBIT_TIME_SAFETY_MS", "1500"))
 
+    # Trading keys (separate from read-only keys). Used for auto TP execution.
+    # Leave empty to fall back to bybit_api_key/secret (must have Trade permission).
+    bybit_trade_api_key: str = os.getenv("BYBIT_TRADE_API_KEY", "")
+    bybit_trade_api_secret: str = os.getenv("BYBIT_TRADE_API_SECRET", "")
+    # Set to true to enable automatic market sells on TP1 and trailing stop triggers.
+    tp_auto_execute: bool = os.getenv("TP_AUTO_EXECUTE", "false").lower() in {"1", "true", "yes", "y", "да"}
+
 settings = Settings()

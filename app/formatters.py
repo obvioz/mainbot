@@ -60,24 +60,74 @@ def format_positions_report(price_map: dict[str, float] | None = None) -> str:
             "Где 10 — сумма в USDT, 2178.5 — твоя фактическая цена покупки."
         )
 
-    lines = ["💼 ОТКРЫТЫЕ ПОЗИЦИИ\n"]
+    lines = ["📊 ОТКРЫТЫЕ ПОЗИЦИИ\n"]
     total_invested = 0.0
     total_value = 0.0
+
     for coin, pos in positions.items():
         current = price_map.get(coin) if price_map else None
-        lines.append(format_position_line(pos, current))
+        avg = float(pos.get("avg_price", 0))
+        qty = float(pos.get("qty", 0))
+        invested = float(pos.get("invested_usdt", pos.get("invested_rub", 0)))
+        entry_count = int(pos.get("entry_count", 1))
+        next_buy = float(pos.get("next_buy_price", 0))
+        next_drop = float(pos.get("next_buy_drop_pct", 0))
+        trailing_active = bool(pos.get("trailing_active", False))
+        trailing_stop = float(pos.get("trailing_stop", 0))
+        tp1_done = bool(pos.get("trailing_tp1_done") or pos.get("tp1_done", False))
+        tp1_price = float(pos.get("tp1_price") or (avg * 1.09 if avg else 0))
+
+        total_invested += invested
+
+        if current and avg:
+            pnl_pct = (current / avg - 1) * 100
+            pnl_usdt = qty * (current - avg)
+            value = qty * current
+            total_value += value
+
+            if pnl_pct >= 2.0:
+                emoji, state = "🟢", "в плюсе"
+            elif pnl_pct >= -2.0:
+                emoji, state = "🟡", "около нуля"
+            else:
+                emoji, state = "🔴", "в просадке"
+
+            pnl_sign = "+" if pnl_usdt >= 0 else "-"
+            pnl_str = f"{pnl_sign}${abs(pnl_usdt):.2f} ({pnl_pct:+.1f}%)"
+
+            if trailing_active and trailing_stop:
+                trailing_str = f"активен, стоп ${fmt_usdt(trailing_stop)}"
+            elif tp1_done:
+                trailing_str = "TP1 исполнен ✅"
+            else:
+                trailing_str = "не активен"
+
+            tp1_str = "исполнен ✅" if tp1_done else f"${fmt_usdt(tp1_price)} (+9%)"
+
+            dca_levels = pos.get("dca_levels_used") or []
+            max_tranches = max(len(dca_levels) + 1, 3)
+            next_buy_str = f"${fmt_usdt(next_buy)} (-{next_drop:.0f}%)" if next_buy else "нет данных"
+
+            lines.append(
+                f"{emoji} {coin} — {state}\n"
+                f"Средний вход: ${fmt_usdt(avg)} | Сейчас: ${fmt_usdt(current)}\n"
+                f"PnL: {pnl_str} | Qty: {qty:.6f}\n"
+                f"Траншей: {entry_count}/{max_tranches} | Следующий добор: {next_buy_str}\n"
+                f"Трейлинг: {trailing_str} | TP1: {tp1_str}"
+            )
+        else:
+            lines.append(format_position_line(pos, current))
+
         lines.append("")
-        total_invested += float(pos.get("invested_usdt", pos.get("invested_rub", 0)))
-        if current:
-            total_value += float(pos.get("qty", 0)) * current
 
     lines.append("━━━━━━━━━━━━")
-    lines.append(f"Вложено: {fmt_money(total_invested)}")
+    lines.append(f"Итого вложено: ${fmt_usdt(total_invested)}")
     if total_value:
         pnl = total_value - total_invested
         pnl_pct = pnl / total_invested * 100 if total_invested else 0
-        lines.append(f"Текущая стоимость: {fmt_money(total_value)}")
-        lines.append(f"Общий PnL: {pnl_pct:+.2f}% / {fmt_money(pnl)}")
+        pnl_sign = "+" if pnl >= 0 else "-"
+        lines.append(f"Текущая стоимость: ${fmt_usdt(total_value)}")
+        lines.append(f"PnL портфеля: {pnl_sign}${abs(pnl):.2f} ({pnl_pct:+.1f}%)")
     return "\n".join(lines)
 
 

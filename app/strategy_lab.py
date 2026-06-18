@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 import csv
 import itertools
+import json
 
 import pandas as pd
 
@@ -15,6 +16,7 @@ from app.strategy_params import update_coin_params, get_coin_params, format_stra
 
 REPORT_DIR = Path('reports')
 DATA_DIR = Path('data')
+ENTRY_LEVELS_PATH = DATA_DIR / 'entry_levels.json'
 
 ENTRY_USDT = 10.0
 
@@ -284,6 +286,126 @@ def run_strategy_lab(start: str, end: str, coin: str | None = None, apply: bool 
             })
 
     return {'start': start, 'end': end, 'coin': coin, 'results': results, 'errors': errors, 'report_path': str(path), 'applied': apply}
+
+
+def calculate_entry_levels(symbol: str) -> dict[str, Any]:
+    """Compute historical entry levels from 365d daily data.
+
+    Calculates per-day drawdown from rolling 90d high and returns
+    the 25th/50th/75th percentiles as t1/t2/t3 (in % below 90d high).
+    """
+    coin = normalize_coin(symbol)
+    exchange = make_public_exchange()
+
+    end = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    start = (datetime.now(timezone.utc) - timedelta(days=365)).strftime('%Y-%m-%d')
+
+    df = fetch_daily_history(exchange, coin, start, end, warmup_days=90)
+
+    df['rolling_max_90'] = df['high'].rolling(90).max().shift(1)
+
+    start_ts = int(_parse_date(start).timestamp() * 1000)
+    df_period = df[df['timestamp'] >= start_ts].copy()
+    df_period = df_period.dropna(subset=['rolling_max_90'])
+    df_period = df_period[df_period['rolling_max_90'] > 0]
+
+    if df_period.empty:
+        raise ValueError(f"Недостаточно данных для {coin}")
+
+    drawdowns = (df_period['close'] / df_period['rolling_max_90'] - 1) * 100
+    negative_dd = drawdowns[drawdowns < 0]
+
+    if len(negative_dd) < 5:
+        cat = CATEGORIES.get(coin, 'STRONG_ALT')
+        base = BASE_DCA_LEVELS.get(cat, BASE_DCA_LEVELS['STRONG_ALT'])
+        t1, t2, t3 = float(base[0]), float(base[1]), float(base[2])
+    else:
+        t1 = abs(float(negative_dd.quantile(0.25)))
+        t2 = abs(float(negative_dd.quantile(0.50)))
+        t3 = abs(float(negative_dd.quantile(0.75)))
+
+    t1 = round(t1, 1)
+    t2 = round(t2, 1)
+    t3 = round(t3, 1)
+    if t2 <= t1:
+        t2 = round(t1 + 3.0, 1)
+    if t3 <= t2:
+        t3 = round(t2 + 5.0, 1)
+
+    return {
+        'coin': coin,
+        't1': t1,
+        't2': t2,
+        't3': t3,
+        'days_analyzed': int(len(df_period)),
+        'negative_dd_days': int(len(negative_dd)),
+        'generated_at': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+    }
+
+
+def run_entry_levels(coins: list[str] | None = None) -> dict[str, Any]:
+    """Compute entry levels for all coins and save to data/entry_levels.json."""
+    targets = [normalize_coin(c) for c in (coins or COINS)]
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if ENTRY_LEVELS_PATH.exists():
+        try:
+            existing = json.loads(ENTRY_LEVELS_PATH.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+
+    results: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    for coin in targets:
+        try:
+            r = calculate_entry_levels(coin)
+            results[coin] = r
+            existing[coin] = r
+        except Exception as exc:
+            errors[coin] = str(exc)
+
+    if results:
+        ENTRY_LEVELS_PATH.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    return {'results': results, 'errors': errors}
+
+
+def get_entry_levels(coin: str) -> dict[str, Any] | None:
+    """Return saved entry levels for a coin, or None if not computed yet."""
+    coin = normalize_coin(coin)
+    if not ENTRY_LEVELS_PATH.exists():
+        return None
+    try:
+        data = json.loads(ENTRY_LEVELS_PATH.read_text(encoding='utf-8'))
+        return data.get(coin)
+    except Exception:
+        return None
+
+
+def format_entry_levels_report(summary: dict[str, Any]) -> str:
+    results = summary.get('results', {})
+    errors = summary.get('errors', {})
+    lines = ['📐 УРОВНИ ВХОДА (Entry Levels)', '']
+    if results:
+        lines.append(f"{'Монета':<8} {'T1%':>6} {'T2%':>6} {'T3%':>6} {'Дней':>5} {'Из них <0':>9}")
+        lines.append('─' * 46)
+        for coin, r in sorted(results.items()):
+            lines.append(
+                f"{r['coin']:<8} {r['t1']:>6.1f} {r['t2']:>6.1f} {r['t3']:>6.1f}"
+                f" {r['days_analyzed']:>5} {r['negative_dd_days']:>9}"
+            )
+        lines += [
+            '',
+            'T1 = 25й перцентиль просадки от 90d max (мелкий вход)',
+            'T2 = 50й перцентиль (средний вход)',
+            'T3 = 75й перцентиль (глубокий вход)',
+            f"Сохранено: {ENTRY_LEVELS_PATH}",
+        ]
+    if errors:
+        lines += ['', '⚠️ Ошибки:']
+        for coin, err in errors.items():
+            lines.append(f"• {coin}: {err}")
+    return '\n'.join(lines)
 
 
 def format_strategy_lab_report(summary: dict[str, Any]) -> str:

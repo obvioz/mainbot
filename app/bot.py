@@ -26,9 +26,16 @@ from app.backtest import backtest_coin, backtest_all, format_backtest_coin_repor
 from app.system_log import add_system_event, add_user_note, build_context_summary, export_context_markdown
 from app.error_log import log_error, format_error_summary, export_errors_markdown
 from app.ml_dataset import export_ml_dataset, format_ml_dataset_summary
-from app.strategy_lab import run_strategy_lab, format_strategy_lab_report, five_year_start
+from app.strategy_lab import (
+    run_strategy_lab, format_strategy_lab_report, five_year_start,
+    run_entry_levels, format_entry_levels_report, get_entry_levels,
+)
 from app.strategy_robustness import run_robustness_lab, format_robustness_report, format_reliability_report
 from app.strategy_params import format_strategy_params
+from app.spot_journal import (
+    log_spot_buy, log_spot_sell,
+    format_spot_journal, format_spot_report, export_spot_csv,
+)
 from app.bootstrap import auto_strategy_bootstrap
 from app.market_cache import get_cached
 from app.market_memory import record_scan_snapshot, latest_snapshot, snapshot_delta, format_delta_report, format_memory_status
@@ -352,6 +359,43 @@ async def cmd_buy(message: Message):
         pos = record_buy(coin, amount_usdt, price, reason="manual", dca_levels=dca_levels)
         try:
             add_system_event("BUY", f"Покупка {coin}", data={"coin": coin, "amount_usdt": amount_usdt, "price": price, "avg_price": pos.get("avg_price"), "entry_count": pos.get("entry_count"), "next_buy_price": pos.get("next_buy_price")})
+        except Exception:
+            pass
+        # Spot journal: log buy with available indicators
+        try:
+            _mi = market_item if market_item else {}
+            _deriv = (_mi.get("derivatives") or {})
+            _news = (_mi.get("news_risk") or {})
+            _dd90 = _mi.get("drawdown_90d_high")
+            _levels = get_entry_levels(coin)
+            _trigger, _trigger_pct = "manual", None
+            if _levels and _dd90 is not None:
+                _dd_abs = abs(float(_dd90))
+                if _levels.get("t3") and _dd_abs >= float(_levels["t3"]):
+                    _trigger, _trigger_pct = f"t3 (-{_levels['t3']}%)", float(_levels["t3"])
+                elif _levels.get("t2") and _dd_abs >= float(_levels["t2"]):
+                    _trigger, _trigger_pct = f"t2 (-{_levels['t2']}%)", float(_levels["t2"])
+                elif _levels.get("t1") and _dd_abs >= float(_levels["t1"]):
+                    _trigger, _trigger_pct = f"t1 (-{_levels['t1']}%)", float(_levels["t1"])
+            _indicators = {
+                "drawdown_pct": _dd90,
+                "score": None,
+                "volume_ratio": None,
+                "funding": _deriv.get("funding_pct"),
+                "news_risk": _news.get("state"),
+                "volatility": _mi.get("volatility_class"),
+            }
+            log_spot_buy(
+                symbol=coin,
+                tranche=int(pos.get("entry_count", 1)),
+                entry_price=price,
+                amount_usdt=amount_usdt,
+                qty=amount_usdt / price,
+                trigger=_trigger,
+                trigger_pct=_trigger_pct,
+                auto=False,
+                indicators=_indicators,
+            )
         except Exception:
             pass
         risk_text = format_buy_risk_warning(risk_check)
@@ -715,6 +759,23 @@ async def cmd_lab(message: Message):
             "/lab 2024-01-01 2026-05-30\n"
             "/lab ETH 2024-01-01 2026-05-30"
         )
+
+
+async def cmd_entrylevels(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    parts = (message.text or "").split()
+    coin = normalize_coin(parts[1]) if len(parts) >= 2 else None
+    try:
+        target = coin if coin else "всем монетам"
+        await message.answer(f"📐 Считаю уровни входа по {target}. Это займёт ~1 минуту...")
+        summary = await asyncio.to_thread(run_entry_levels, [coin] if coin else None)
+        report = format_entry_levels_report(summary)
+        for chunk in split_text(report):
+            await message.answer(chunk)
+    except Exception as exc:
+        await message.answer(f"Ошибка расчёта entry levels: {exc}")
 
 
 async def cmd_strategyparams(message: Message):
@@ -1105,7 +1166,43 @@ async def on_callback(call: CallbackQuery):
                 entry_usdt = 0.0
             try:
                 price = await get_current_price(coin)
-                record_buy(coin, entry_usdt, price, reason="signal_button")
+                pos = record_buy(coin, entry_usdt, price, reason="signal_button")
+                # Spot journal: log signal-button buy
+                try:
+                    _market_item = await asyncio.to_thread(analyze_coin, make_exchange(), coin)
+                    _deriv = (_market_item.get("derivatives") or {})
+                    _news = (_market_item.get("news_risk") or {})
+                    _dd90 = _market_item.get("drawdown_90d_high")
+                    _levels = get_entry_levels(coin)
+                    _trigger, _trigger_pct = "сигнал", None
+                    if _levels and _dd90 is not None:
+                        _dd_abs = abs(float(_dd90))
+                        if _levels.get("t3") and _dd_abs >= float(_levels["t3"]):
+                            _trigger, _trigger_pct = f"t3 (-{_levels['t3']}%)", float(_levels["t3"])
+                        elif _levels.get("t2") and _dd_abs >= float(_levels["t2"]):
+                            _trigger, _trigger_pct = f"t2 (-{_levels['t2']}%)", float(_levels["t2"])
+                        elif _levels.get("t1") and _dd_abs >= float(_levels["t1"]):
+                            _trigger, _trigger_pct = f"t1 (-{_levels['t1']}%)", float(_levels["t1"])
+                    log_spot_buy(
+                        symbol=coin,
+                        tranche=int(pos.get("entry_count", 1)),
+                        entry_price=price,
+                        amount_usdt=entry_usdt,
+                        qty=entry_usdt / price if price else 0,
+                        trigger=_trigger,
+                        trigger_pct=_trigger_pct,
+                        auto=True,
+                        indicators={
+                            "drawdown_pct": _dd90,
+                            "score": None,
+                            "volume_ratio": None,
+                            "funding": _deriv.get("funding_pct"),
+                            "news_risk": _news.get("state"),
+                            "volatility": _market_item.get("volatility_class"),
+                        },
+                    )
+                except Exception:
+                    pass
                 await call.message.answer(
                     f"✅ Записано: {coin} ${entry_usdt:.0f} по ${fmt_usdt(price)}"
                 )
@@ -1193,6 +1290,37 @@ async def pending_buy_amount_handler(message: Message):
         )
     except Exception as exc:
         await message.answer(f"Не смог записать покупку: {exc}")
+async def cmd_spotjournal(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    await message.answer(format_spot_journal(10))
+
+
+async def cmd_spotreport(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        report7 = format_spot_report(7)
+        report30 = format_spot_report(30)
+        await message.answer(report7)
+        await message.answer(report30)
+    except Exception as exc:
+        await message.answer(f"Ошибка spot report: {exc}")
+
+
+async def cmd_exportspot(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        path = await asyncio.to_thread(export_spot_csv)
+        await message.answer_document(FSInputFile(path), caption="📊 Spot Journal CSV")
+    except Exception as exc:
+        await message.answer(f"Не смог выгрузить spot journal: {exc}")
+
+
 async def cmd_futures(message: Message):
     if not is_allowed(message):
         await message.answer("Нет доступа.")
@@ -1315,6 +1443,11 @@ async def main():
     dp.message.register(cmd_backtestall, Command("backtestall"))
 
     dp.message.register(cmd_lab, Command("lab"))
+    dp.message.register(cmd_entrylevels, Command("entrylevels"))
+
+    dp.message.register(cmd_spotjournal, Command("spotjournal"))
+    dp.message.register(cmd_spotreport, Command("spotreport"))
+    dp.message.register(cmd_exportspot, Command("exportspot"))
 
     dp.message.register(cmd_strategyparams, Command("strategyparams"))
     dp.message.register(cmd_robust, Command("robust"))
