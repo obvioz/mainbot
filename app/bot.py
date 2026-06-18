@@ -340,6 +340,30 @@ async def cmd_memory(message: Message):
     await message.answer(format_memory_status())
 
 
+def check_buy_allowed(coin: str, amount_usdt: float, price: float | None) -> tuple[bool, str, dict]:
+    """Единая точка проверки риска перед ЛЮБОЙ записью покупки.
+
+    Используется всеми путями входа (текстовая /buy, кнопка «✅ Купить», ручной
+    ввод суммы), чтобы жёсткий лимит max_entries нельзя было обойти.
+
+    Возвращает (allowed, message, risk_check):
+      - allowed=False → message содержит причину отказа (готово для ответа юзеру);
+      - allowed=True  → message содержит мягкие предупреждения (можно показать).
+    """
+    risk_check = check_buy_risk(coin, amount_usdt, price)
+    if not risk_check["allowed"]:
+        cr = risk_check.get("coin_risk") or {}
+        entry_count = int(cr.get("entry_count", 0) or 0)
+        max_entries = int(cr.get("max_entries", 0) or 0)
+        reason = "; ".join(risk_check.get("blockers") or ["превышен лимит риска"])
+        message = (
+            f"⚠️ Вход отклонён: {reason}.\n"
+            f"Транш {entry_count} из {max_entries} уже использованы."
+        )
+        return False, message, risk_check
+    return True, format_buy_risk_warning(risk_check), risk_check
+
+
 async def cmd_buy(message: Message):
     if not is_allowed(message):
         await message.answer("Нет доступа.")
@@ -347,9 +371,9 @@ async def cmd_buy(message: Message):
     parts = message.text.split()
     try:
         coin, amount_usdt, price = parse_buy_args(parts)
-        risk_check = check_buy_risk(coin, amount_usdt, price)
-        if not risk_check["allowed"]:
-            await message.answer(format_buy_risk_warning(risk_check))
+        allowed, risk_msg, risk_check = check_buy_allowed(coin, amount_usdt, price)
+        if not allowed:
+            await message.answer(risk_msg)
             return
         try:
             market_item = await asyncio.to_thread(analyze_coin, make_exchange(), coin)
@@ -1166,6 +1190,10 @@ async def on_callback(call: CallbackQuery):
                 entry_usdt = 0.0
             try:
                 price = await get_current_price(coin)
+                allowed, risk_msg, _risk_check = check_buy_allowed(coin, entry_usdt, price)
+                if not allowed:
+                    await call.message.answer(risk_msg)
+                    return
                 pos = record_buy(coin, entry_usdt, price, reason="signal_button")
                 # Spot journal: log signal-button buy
                 try:
@@ -1267,9 +1295,9 @@ async def pending_buy_amount_handler(message: Message):
     try:
         amount_usdt = float(parts[0])
         price = float(parts[1])
-        risk_check = check_buy_risk(coin, amount_usdt, price)
-        if not risk_check["allowed"]:
-            await message.answer(format_buy_risk_warning(risk_check))
+        allowed, risk_msg, risk_check = check_buy_allowed(coin, amount_usdt, price)
+        if not allowed:
+            await message.answer(risk_msg)
             return
         try:
             market_item = await asyncio.to_thread(analyze_coin, make_exchange(), coin)
