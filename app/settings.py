@@ -36,5 +36,8 @@ class Settings:
     bybit_trade_api_secret: str = os.getenv("BYBIT_TRADE_API_SECRET", "")
     # Set to true to enable automatic market sells on TP1 and trailing stop triggers.
     tp_auto_execute: bool = os.getenv("TP_AUTO_EXECUTE", "false").lower() in {"1", "true", "yes", "y", "да"}
+    # Hard ceiling (USDT) on the value of a single AUTO order. Manual /buy and
+    # button orders are NOT limited by this. Default 100 = our agreed auto-entry size.
+    max_auto_order_usdt: float = float(os.getenv("MAX_AUTO_ORDER_USDT", "100"))
 
 settings = Settings()

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -247,10 +248,12 @@ def record_buy(coin: str, amount_usdt: float, price: float, reason: str = "manua
     amount_usdt = float(amount_usdt)
     price = float(price)
 
-    if amount_usdt <= 0:
-        raise ValueError("Сумма покупки должна быть больше 0 USDT")
-    if price <= 0:
-        raise ValueError("Цена покупки должна быть больше 0")
+    # Санити против мусора (NaN/inf/<=0) — применяется и к ручным покупкам.
+    # Примечание: `nan <= 0` это False, поэтому проверку конечности делаем явно.
+    if not math.isfinite(amount_usdt) or amount_usdt <= 0:
+        raise ValueError("Сумма покупки должна быть положительным числом USDT")
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("Цена покупки должна быть положительным числом")
 
     qty = amount_usdt / price
     captured: dict = {}
