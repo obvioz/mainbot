@@ -55,7 +55,16 @@ from app.futures_lab import (
     futures_reset,
     futures_set_enabled,
     circuit_status,
+    load_futures_state,
 )
+from app.pro_lab import (
+    pro_summary,
+    pro_report,
+    export_pro_csv,
+    battle_report,
+    load_pro_state,
+)
+from app.rotation_lab import load_rotation_state
 
 PENDING_BUY: dict[int, str] = {}
 SCAN_LOCK = asyncio.Lock()
@@ -98,9 +107,10 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔍 Скан"), KeyboardButton(text="🌍 Рынок")],
-            [KeyboardButton(text="💼 Позиции"), KeyboardButton(text="🔗 Bybit")],
-            [KeyboardButton(text="🧠 Review"), KeyboardButton(text="🛡️ Риски")],
-            [KeyboardButton(text="📈 Изменения"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="💼 Позиции"), KeyboardButton(text="📊 Активные сделки")],
+            [KeyboardButton(text="🔗 Bybit"), KeyboardButton(text="🧠 Review")],
+            [KeyboardButton(text="🛡️ Риски"), KeyboardButton(text="📈 Изменения")],
+            [KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери действие",
@@ -1450,6 +1460,202 @@ async def cmd_exportrotation(message: Message):
         await message.answer(f"Ошибка экспорта rotation CSV: {exc}")
 
 
+# ─── PRO Lab ─────────────────────────────────────────────────────────────────
+async def cmd_pro(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    await message.answer(await asyncio.to_thread(pro_summary))
+
+
+async def cmd_proreport(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        report7 = await asyncio.to_thread(pro_report, 7)
+        report30 = await asyncio.to_thread(pro_report, 30)
+        for chunk in split_text(report7):
+            await message.answer(chunk)
+        for chunk in split_text(report30):
+            await message.answer(chunk)
+    except Exception as exc:
+        await message.answer(f"Ошибка pro report: {exc}")
+
+
+async def cmd_exportpro(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        path = await asyncio.to_thread(export_pro_csv, 30)
+        await message.answer_document(FSInputFile(path), caption="📊 PRO Lab CSV (30д)")
+    except Exception as exc:
+        await message.answer(f"Ошибка экспорта PRO CSV: {exc}")
+
+
+async def cmd_battle(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        text = await asyncio.to_thread(battle_report)
+        for chunk in split_text(text):
+            await message.answer(chunk)
+    except Exception as exc:
+        await message.answer(f"Ошибка battle: {exc}")
+
+
+# ─── Unified active-trades dashboard (spot + futures + pro + rotation) ──────────
+def _symbol_base(symbol: str) -> str:
+    """'BTC/USDT:USDT' -> 'BTC'."""
+    return (symbol or "").split("/")[0]
+
+
+def _directional_pnl_pct(side: str, entry: float, current: float | None) -> float | None:
+    if not current or not entry or entry <= 0:
+        return None
+    return (current / entry - 1) * 100 if side == "long" else (entry / current - 1) * 100
+
+
+def build_active_trades_report(price_map: dict[str, float] | None = None) -> str:
+    """Single dashboard of every open position across all four systems.
+
+    ``price_map`` maps coin (e.g. 'BTC') -> USDT spot price. Perp positions use the
+    base coin's price; rotation pairs ('X/BTC') are derived as price[X]/price[BTC].
+    Missing prices degrade gracefully to entry-only lines.
+    """
+    price_map = price_map or {}
+    lines = ["📊 АКТИВНЫЕ СДЕЛКИ", ""]
+    total = 0
+
+    # 💰 SPOT — real portfolio
+    lines.append("💰 СПОТ (реальный портфель):")
+    positions = get_open_positions()
+    if positions:
+        for coin, pos in positions.items():
+            avg = float(pos.get("avg_price", 0) or 0)
+            qty = float(pos.get("qty", 0) or 0)
+            entry_count = int(pos.get("entry_count", 1) or 1)
+            dca = pos.get("dca_levels_used") or []
+            max_tr = max(len(dca) + 1, 3)
+            cur = price_map.get(coin)
+            pnl = _directional_pnl_pct("long", avg, cur)
+            pnl_str = f"{pnl:+.1f}%" if pnl is not None else "н/д"
+            cur_str = f"${fmt_usdt(cur)}" if cur else "—"
+            lines.append(
+                f"  • {coin}: вход ${fmt_usdt(avg)} | сейчас {cur_str} | "
+                f"PnL {pnl_str} | qty {qty:.6f} | транш {entry_count}/{max_tr}"
+            )
+            total += 1
+    else:
+        lines.append("  нет открытых позиций")
+    lines.append("")
+
+    # 🤖 FUTURES — our bot, demo
+    lines.append("🤖 ФЬЮЧЕРСЫ (наш бот, демо):")
+    fa = (load_futures_state() or {}).get("active_trade")
+    if fa:
+        side = str(fa.get("side", "")).lower()
+        entry = float(fa.get("entry_price") or 0)
+        stop = float(fa.get("trailing_stop") or fa.get("stop_price") or 0)
+        cur = price_map.get(_symbol_base(fa.get("symbol", "")))
+        pnl = _directional_pnl_pct(side, entry, cur)
+        pnl_str = f"{pnl:+.1f}%" if pnl is not None else "н/д"
+        cur_str = f"{cur:g}" if cur else "—"
+        score = fa.get("score")
+        score_str = f" | score {score}" if score is not None else ""
+        lines.append(
+            f"  • {fa.get('symbol')} {side.upper()} [{fa.get('strategy')}]{score_str}\n"
+            f"    вход {entry:g} | сейчас {cur_str} | PnL {pnl_str} | стоп {stop:g}"
+        )
+        total += 1
+    else:
+        lines.append("  нет активной сделки")
+    lines.append("")
+
+    # 🎯 PRO FUTURES — demo
+    lines.append("🎯 ФЬЮЧЕРСЫ ПРО (демо):")
+    pa = (load_pro_state() or {}).get("active_trade")
+    if pa:
+        side = str(pa.get("side", "")).lower()
+        entry = float(pa.get("avg_entry_price") or pa.get("entry_price") or 0)
+        stop = float(pa.get("trailing_stop") or pa.get("stop_price") or 0)
+        cur = price_map.get(_symbol_base(pa.get("symbol", "")))
+        pnl = _directional_pnl_pct(side, entry, cur)
+        pnl_str = f"{pnl:+.1f}%" if pnl is not None else "н/д"
+        cur_str = f"{cur:g}" if cur else "—"
+        adds = int(pa.get("adds") or 0)
+        lines.append(
+            f"  • {pa.get('symbol')} {side.upper()} | доборов {adds}\n"
+            f"    вход {entry:g} | сейчас {cur_str} | PnL {pnl_str} | стоп {stop:g}"
+        )
+        total += 1
+    else:
+        lines.append("  нет активной сделки")
+    lines.append("")
+
+    # 🔄 ROTATION — crypto pairs, demo
+    lines.append("🔄 КРИПТОПАРЫ (ротация, демо):")
+    ra = (load_rotation_state() or {}).get("active_trade")
+    if ra:
+        pair = ra.get("pair", "")
+        entry = float(ra.get("entry_price") or 0)
+        parts = pair.split("/")
+        cur = None
+        if len(parts) == 2:
+            base_p = price_map.get(parts[0])
+            quote_p = price_map.get(parts[1])
+            if base_p and quote_p:
+                cur = base_p / quote_p
+        pnl = _directional_pnl_pct("long", entry, cur)
+        pnl_str = f"{pnl:+.1f}%" if pnl is not None else "н/д"
+        cur_str = f"{cur:.8g}" if cur else "—"
+        trailing = "активен" if ra.get("trailing_activated") else "ждёт"
+        lines.append(
+            f"  • {pair}: вход {entry:.8g} | сейчас {cur_str} | "
+            f"PnL {pnl_str} | трейлинг {trailing}"
+        )
+        total += 1
+    else:
+        lines.append("  нет активной сделки")
+    lines.append("")
+
+    lines.append("━━━━━━━━━━━━")
+    lines.append(f"Всего открытых позиций по всем системам: {total}")
+    return "\n".join(lines)
+
+
+async def cmd_active(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        price_map = await build_price_map()
+        # Augment the map with any open perp/rotation instruments not in our COINS map.
+        needed: set[str] = set()
+        fa = (await asyncio.to_thread(load_futures_state) or {}).get("active_trade")
+        if fa:
+            needed.add(_symbol_base(fa.get("symbol", "")))
+        pa = (await asyncio.to_thread(load_pro_state) or {}).get("active_trade")
+        if pa:
+            needed.add(_symbol_base(pa.get("symbol", "")))
+        ra = (await asyncio.to_thread(load_rotation_state) or {}).get("active_trade")
+        if ra:
+            needed.update(ra.get("pair", "").split("/"))
+        for coin in needed:
+            if coin and coin not in price_map:
+                try:
+                    price_map[coin] = await get_current_price(coin)
+                except Exception:
+                    pass
+        text = await asyncio.to_thread(build_active_trades_report, price_map)
+        for chunk in split_text(text):
+            await message.answer(chunk)
+    except Exception as exc:
+        await message.answer(f"Ошибка дашборда активных сделок: {exc}")
+
+
 async def main():
     if not settings.telegram_bot_token:
         raise RuntimeError("Не указан TELEGRAM_BOT_TOKEN в .env")
@@ -1528,6 +1734,13 @@ async def main():
     dp.message.register(cmd_rotationreport, Command("rotationreport"))
     dp.message.register(cmd_exportrotation, Command("exportrotation"))
 
+    # PRO Lab + battle + unified active dashboard
+    dp.message.register(cmd_pro, Command("pro"))
+    dp.message.register(cmd_proreport, Command("proreport"))
+    dp.message.register(cmd_exportpro, Command("exportpro"))
+    dp.message.register(cmd_battle, Command("battle"))
+    dp.message.register(cmd_active, Command("active"))
+
     # Кнопки
     dp.message.register(btn_scan, F.text.in_({"📊 Скан", "🔍 Скан"}))
     dp.message.register(btn_status, F.text.in_({"🌍 Статус", "🌍 Рынок"}))
@@ -1536,6 +1749,7 @@ async def main():
     dp.message.register(cmd_memory, F.text == "🧠 Память")
 
     dp.message.register(btn_positions, F.text == "💼 Позиции")
+    dp.message.register(cmd_active, F.text == "📊 Активные сделки")
 
     dp.message.register(cmd_bybit, F.text == "🔗 Bybit")
     dp.message.register(cmd_syncbybit, F.text == "🔄 Sync Bybit")

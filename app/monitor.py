@@ -20,12 +20,14 @@ from app.market_intelligence import build_market_context
 from app.bybit_portfolio_monitor import check_bybit_portfolio_changes
 from app.rotation_lab import rotation_tick
 from app.futures_lab import futures_tick, format_futures_event
+from app.pro_lab import pro_tick, format_pro_event
 
 STATE_PATH = Path("data/monitor_state.json")
 SIGNAL_STATUSES = {"STRONG_BUY", "ACCUMULATION"}
 
 ROTATION_INTERVAL_SECONDS = 5 * 60
 FUTURES_INTERVAL_SECONDS = 5 * 60
+PRO_INTERVAL_SECONDS = 5 * 60
 
 TRAILING_TP1_PCT = 9.0      # % роста от средней для активации трейлинга
 TRAILING_TP1_SHARE = 0.40   # доля позиции, которую рекомендуем закрыть на TP1
@@ -537,6 +539,7 @@ async def monitor_loop(bot: Bot) -> None:
     last_bybit_scan = 0.0
     last_rotation_scan = 0.0
     last_futures_scan = 0.0
+    last_pro_scan = 0.0
 
     bybit_interval = max(settings.bybit_portfolio_monitor_minutes, 1) * 60
 
@@ -583,6 +586,20 @@ async def monitor_loop(bot: Bot) -> None:
             except Exception as exc:
                 await bot.send_message(chat_id, f"⚠️ Ошибка Futures Lab: {exc}")
                 last_futures_scan = now
+
+        # PRO Lab demo tick (trend-following competitor to Futures Lab)
+        if now - last_pro_scan >= PRO_INTERVAL_SECONDS:
+            try:
+                result = await asyncio.to_thread(pro_tick)
+                text = format_pro_event(result.get("event"))
+                if text:
+                    await bot.send_message(chat_id, text)
+                for note in result.get("notifications") or []:
+                    await bot.send_message(chat_id, note)
+                last_pro_scan = now
+            except Exception as exc:
+                await bot.send_message(chat_id, f"⚠️ Ошибка PRO Lab: {exc}")
+                last_pro_scan = now
 
         if now - last_market_scan >= interval_seconds:
             try:
