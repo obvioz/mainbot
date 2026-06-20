@@ -19,6 +19,7 @@ from app.storage import record_buy, record_sell, get_open_positions, export_jour
 from app.formatters import format_positions_report, format_journal, format_stats_report, format_risk_report, format_buy_risk_warning, fmt_usdt, fmt_money
 from app.ui import split_text
 from app.risk_manager import check_buy_risk
+from app.coin_health import health_check, blocks_entry
 from app.position_quality import position_quality_score, format_position_quality
 from app.bybit_sync import format_bybit_portfolio, sync_bybit_to_local
 from app.bybit_portfolio_monitor import check_bybit_portfolio_changes
@@ -372,7 +373,29 @@ def check_buy_allowed(coin: str, amount_usdt: float, price: float | None) -> tup
             f"Транш {entry_count} из {max_entries} уже использованы."
         )
         return False, message, risk_check
-    return True, format_buy_risk_warning(risk_check), risk_check
+
+    # Health-check монеты по данным биржи (статус пары, ликвидность, аномалия цены,
+    # спред). Это жёсткий фильтр здоровья ВМЕСТО ненадёжного news_risk: DEAD/ANOMALY
+    # блокируют вход, WARNING разрешает с пометкой.
+    try:
+        health = health_check(coin)
+    except Exception as exc:
+        health = {"status": "UNKNOWN", "reasons": [f"health-check недоступен: {exc}"], "details": {}}
+    risk_check["health"] = health
+
+    if blocks_entry(health):
+        reason = "; ".join(health.get("reasons") or ["здоровье монеты под вопросом"])
+        return False, f"⚠️ Вход в {coin} заблокирован: {reason}", risk_check
+
+    warn = format_buy_risk_warning(risk_check)
+    status = health.get("status")
+    if status == "WARNING":
+        hwarn = "⚠️ Здоровье монеты: WARNING — " + "; ".join(health.get("reasons") or [])
+        warn = (warn + "\n" + hwarn).strip() if warn else hwarn
+    elif status == "UNKNOWN":
+        note = "ℹ️ Здоровье монеты не проверено (биржа недоступна)"
+        warn = (warn + "\n" + note).strip() if warn else note
+    return True, warn, risk_check
 
 
 async def cmd_buy(message: Message):
@@ -382,7 +405,7 @@ async def cmd_buy(message: Message):
     parts = message.text.split()
     try:
         coin, amount_usdt, price = parse_buy_args(parts)
-        allowed, risk_msg, risk_check = check_buy_allowed(coin, amount_usdt, price)
+        allowed, risk_msg, risk_check = await asyncio.to_thread(check_buy_allowed, coin, amount_usdt, price)
         if not allowed:
             await message.answer(risk_msg)
             return
@@ -419,6 +442,7 @@ async def cmd_buy(message: Message):
                 "funding": _deriv.get("funding_pct"),
                 "news_risk": _news.get("state"),
                 "volatility": _mi.get("volatility_class"),
+                "health": (risk_check.get("health") or {}).get("status"),
             }
             log_spot_buy(
                 symbol=coin,
@@ -1201,7 +1225,7 @@ async def on_callback(call: CallbackQuery):
                 entry_usdt = 0.0
             try:
                 price = await get_current_price(coin)
-                allowed, risk_msg, _risk_check = check_buy_allowed(coin, entry_usdt, price)
+                allowed, risk_msg, _risk_check = await asyncio.to_thread(check_buy_allowed, coin, entry_usdt, price)
                 if not allowed:
                     await call.message.answer(risk_msg)
                     return
@@ -1238,6 +1262,7 @@ async def on_callback(call: CallbackQuery):
                             "funding": _deriv.get("funding_pct"),
                             "news_risk": _news.get("state"),
                             "volatility": _market_item.get("volatility_class"),
+                            "health": (_risk_check.get("health") or {}).get("status"),
                         },
                     )
                 except Exception:
@@ -1306,7 +1331,7 @@ async def pending_buy_amount_handler(message: Message):
     try:
         amount_usdt = float(parts[0])
         price = float(parts[1])
-        allowed, risk_msg, risk_check = check_buy_allowed(coin, amount_usdt, price)
+        allowed, risk_msg, risk_check = await asyncio.to_thread(check_buy_allowed, coin, amount_usdt, price)
         if not allowed:
             await message.answer(risk_msg)
             return

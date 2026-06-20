@@ -237,7 +237,7 @@ def export_spot_csv() -> Path:
         "tranche", "entry_price", "amount_usdt", "qty",
         "trigger", "trigger_pct", "auto", "reason", "portfolio_usdt_before",
         "ind_drawdown_pct", "ind_score", "ind_volume_ratio",
-        "ind_funding", "ind_news_risk", "ind_volatility",
+        "ind_funding", "ind_news_risk", "ind_volatility", "ind_health",
         "exit_type", "entry_price_avg", "exit_price", "qty_sold",
         "pnl_pct", "pnl_usdt", "hold_hours", "trailing_max_price", "exit_reason",
     ]
@@ -254,5 +254,6 @@ def export_spot_csv() -> Path:
             flat["ind_funding"] = ind.get("funding")
             flat["ind_news_risk"] = ind.get("news_risk")
             flat["ind_volatility"] = ind.get("volatility")
+            flat["ind_health"] = ind.get("health")
             writer.writerow(flat)
     return path

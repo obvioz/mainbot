@@ -133,7 +133,10 @@ def _risk_state(derivatives: dict, news_risk: dict, btc_weak: bool, coin: str) -
     if news_risk:
         state = news_risk.get("state")
         if state == "HIGH":
-            score -= 45; reasons.append(news_risk.get("comment", "высокий новостной риск")); hard_avoid = coin not in {"BTC", "ETH"}
+            # News-риск пока ненадёжен (keyword-substring матчинг даёт ложные HIGH
+            # даже по BTC). Поэтому он только штрафует score, но НЕ блокирует вход.
+            # Жёсткий запрет здоровья монеты делает coin_health.health_check по данным биржи.
+            score -= 45; reasons.append(news_risk.get("comment", "высокий новостной риск"))
         elif state == "ELEVATED":
             score -= 22; reasons.append(news_risk.get("comment", "повышенный новостной риск"))
         elif state == "LOW":
