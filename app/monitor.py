@@ -21,6 +21,7 @@ from app.bybit_portfolio_monitor import check_bybit_portfolio_changes
 from app.rotation_lab import rotation_tick
 from app.futures_lab import futures_tick, format_futures_event
 from app.pro_lab import pro_tick, format_pro_event
+from app.volatility_profile import maybe_refresh_profiles
 
 STATE_PATH = Path("data/monitor_state.json")
 SIGNAL_STATUSES = {"STRONG_BUY", "ACCUMULATION"}
@@ -28,6 +29,9 @@ SIGNAL_STATUSES = {"STRONG_BUY", "ACCUMULATION"}
 ROTATION_INTERVAL_SECONDS = 5 * 60
 FUTURES_INTERVAL_SECONDS = 5 * 60
 PRO_INTERVAL_SECONDS = 5 * 60
+# Проверяем возраст профилей волатильности раз в 6ч; сам пересчёт срабатывает
+# только если профили старше 7 дней (логика внутри maybe_refresh_profiles).
+VOLPROFILE_INTERVAL_SECONDS = 6 * 3600
 
 TRAILING_TP1_PCT = 9.0      # % роста от средней для активации трейлинга
 TRAILING_TP1_SHARE = 0.40   # доля позиции, которую рекомендуем закрыть на TP1
@@ -540,11 +544,23 @@ async def monitor_loop(bot: Bot) -> None:
     last_rotation_scan = 0.0
     last_futures_scan = 0.0
     last_pro_scan = 0.0
+    last_volprofile_scan = 0.0
 
     bybit_interval = max(settings.bybit_portfolio_monitor_minutes, 1) * 60
 
     while True:
         now = time.monotonic()
+
+        # Профиль волатильности монет: автопересчёт раз в 7 дней.
+        if now - last_volprofile_scan >= VOLPROFILE_INTERVAL_SECONDS:
+            try:
+                refreshed = await asyncio.to_thread(maybe_refresh_profiles)
+                if refreshed:
+                    await bot.send_message(chat_id, "📊 Профили волатильности монет пересчитаны (раз в 7 дней).")
+                last_volprofile_scan = now
+            except Exception as exc:
+                log_error("monitor.volprofile_refresh", exc, {})
+                last_volprofile_scan = now
 
         if (
             settings.bybit_portfolio_monitor_enabled

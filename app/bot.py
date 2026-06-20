@@ -20,6 +20,12 @@ from app.formatters import format_positions_report, format_journal, format_stats
 from app.ui import split_text
 from app.risk_manager import check_buy_risk
 from app.coin_health import health_check, blocks_entry
+from app.volatility_profile import (
+    format_volprofiles_table,
+    refresh_all_profiles,
+    profiles_need_refresh,
+    all_profiles,
+)
 from app.position_quality import position_quality_score, format_position_quality
 from app.bybit_sync import format_bybit_portfolio, sync_bybit_to_local
 from app.bybit_portfolio_monitor import check_bybit_portfolio_changes
@@ -835,6 +841,24 @@ async def cmd_entrylevels(message: Message):
             await message.answer(chunk)
     except Exception as exc:
         await message.answer(f"Ошибка расчёта entry levels: {exc}")
+
+
+async def cmd_volprofiles(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    parts = (message.text or "").split()
+    force = len(parts) >= 2 and parts[1].lower() in {"refresh", "force", "пересчитай"}
+    try:
+        if force or profiles_need_refresh() or not all_profiles():
+            await message.answer("📊 Считаю профили волатильности по всем монетам. Это займёт ~1 минуту...")
+            store = await asyncio.to_thread(refresh_all_profiles)
+        else:
+            store = None  # формат прочитает свежий файл сам
+        for chunk in split_text(format_volprofiles_table(store)):
+            await message.answer(chunk)
+    except Exception as exc:
+        await message.answer(f"Ошибка расчёта профилей волатильности: {exc}")
 
 
 async def cmd_strategyparams(message: Message):
@@ -1716,6 +1740,7 @@ async def main():
 
     dp.message.register(cmd_lab, Command("lab"))
     dp.message.register(cmd_entrylevels, Command("entrylevels"))
+    dp.message.register(cmd_volprofiles, Command("volprofiles"))
 
     dp.message.register(cmd_spotjournal, Command("spotjournal"))
     dp.message.register(cmd_spotreport, Command("spotreport"))
