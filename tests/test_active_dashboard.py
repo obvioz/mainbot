@@ -38,7 +38,7 @@ _orig = (b.get_open_positions, b.load_futures_state, b.load_pro_state, b.load_ro
 
 
 print("\n[Test 1] All systems empty -> every section shows 'нет', total 0")
-patch_sources({}, {"active_trade": None}, {"active_trade": None}, {"active_trade": None})
+patch_sources({}, {"active_trade": None}, {"active_trade": None}, {"open_trades": []})
 rep = b.build_active_trades_report({})
 check("spot section header", "💰 СПОТ" in rep)
 check("futures section header", "🤖 ФЬЮЧЕРСЫ (наш бот" in rep)
@@ -56,7 +56,7 @@ patch_sources(
                           "trailing_stop": 1950.0, "strategy": "mean_reversion", "score": 78}},
     pro={"active_trade": {"symbol": "SOL/USDT:USDT", "side": "long", "avg_entry_price": 150.0,
                           "trailing_stop": 145.0, "adds": 1}},
-    rot={"active_trade": {"pair": "SOL/BTC", "entry_price": 0.0025, "trailing_activated": True}},
+    rot={"open_trades": [{"pair": "SOL/BTC", "entry_price": 0.0025, "trailing_activated": True}]},
 )
 price_map = {"BTC": 62000.0, "ETH": 2100.0, "SOL": 160.0}
 rep = b.build_active_trades_report(price_map)
@@ -75,7 +75,7 @@ patch_sources(
     fut={"active_trade": None},
     pro={"active_trade": {"symbol": "BTC/USDT:USDT", "side": "short", "avg_entry_price": 60000.0,
                           "trailing_stop": 61000.0, "adds": 0}},
-    rot={"active_trade": None},
+    rot={"open_trades": []},
 )
 rep = b.build_active_trades_report({"ETH": 1900.0, "BTC": 59000.0})
 check("total is 2", "Всего открытых позиций по всем системам: 2" in rep)
@@ -90,7 +90,7 @@ patch_sources(
     fut={"active_trade": {"symbol": "DOGE/USDT:USDT", "side": "long", "entry_price": 0.1,
                           "trailing_stop": 0.09, "strategy": "pro_trend"}},
     pro={"active_trade": None},
-    rot={"active_trade": None},
+    rot={"open_trades": []},
 )
 rep = b.build_active_trades_report({})  # no DOGE price
 check("missing price -> PnL н/д", "PnL н/д" in rep)

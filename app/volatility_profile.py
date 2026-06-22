@@ -49,6 +49,12 @@ MEDIUM_MAX_PCT = 6.0
 REGIME_QUIET_MAX = 0.7
 REGIME_NORMAL_MAX = 1.3
 
+# --- Защитные границы для уровней входа (используются signals И storage) ------
+# Единый источник DCA-уровней всей цепочки: первый вход, превью, доборы позиции.
+ENTRY_LEVEL_MIN_T1 = 2.0    # транш 1 не ближе -2% (защита от шума на сверхспокойной монете)
+ENTRY_LEVEL_MAX_T3 = 45.0   # транш 3 не дальше -45% (защита от недостижимого уровня на дикой)
+FALLBACK_ENTRY_LEVELS = [5.0, 10.0, 18.0]  # если профиля нет — разумные дефолты
+
 
 # --------------------------------------------------------------------------
 # Чистые расчёты (без сети — легко тестировать)
@@ -167,6 +173,65 @@ def get_profile(coin: str) -> dict | None:
 
 def all_profiles() -> dict[str, dict]:
     return dict(_read_store().get("profiles") or {})
+
+
+def get_entry_levels_for_coin(coin: str) -> dict:
+    """Персональные уровни входа (траншы 1/2/3 в %) из профиля волатильности.
+
+    ЕДИНЫЙ источник DCA-уровней для всей цепочки: первый вход и его оценка в
+    signals.py, превью следующего уровня, и доборы открытой позиции в storage.py.
+
+    Берёт entry_levels из get_profile(coin) и применяет защитные границы:
+    транш 1 ≥ -2%, транш 3 ≤ -45%, лесенка строго возрастающая. Если профиля
+    нет — fallback на дефолты с пометкой profile_missing. Никогда не падает.
+
+    Возвращает: {levels, vol_class, vol_regime, atr_short_pct,
+                 profile_missing: bool, clamped: bool, source}.
+    """
+    try:
+        profile = get_profile(coin)
+    except Exception:
+        profile = None
+
+    raw = profile.get("entry_levels") if profile else None
+    if not raw:
+        return {
+            "levels": list(FALLBACK_ENTRY_LEVELS),
+            "vol_class": None,
+            "vol_regime": None,
+            "atr_short_pct": None,
+            "profile_missing": True,
+            "clamped": False,
+            "source": "fallback",
+        }
+
+    levels = [abs(float(x)) for x in raw][:3]
+    while len(levels) < 3:
+        nxt = (levels[-1] * 1.8) if levels else FALLBACK_ENTRY_LEVELS[len(levels)]
+        levels.append(round(nxt, 1))
+
+    clamped = False
+    if levels[0] < ENTRY_LEVEL_MIN_T1:
+        levels[0] = ENTRY_LEVEL_MIN_T1
+        clamped = True
+    if levels[2] > ENTRY_LEVEL_MAX_T3:
+        levels[2] = ENTRY_LEVEL_MAX_T3
+        clamped = True
+    # Лесенка должна строго возрастать даже после клампинга.
+    if levels[1] <= levels[0]:
+        levels[1] = round(levels[0] + 1.0, 1)
+    if levels[2] <= levels[1]:
+        levels[2] = min(round(levels[1] + 1.0, 1), ENTRY_LEVEL_MAX_T3)
+
+    return {
+        "levels": levels,
+        "vol_class": profile.get("class"),
+        "vol_regime": profile.get("vol_regime"),
+        "atr_short_pct": profile.get("atr_short_pct"),
+        "profile_missing": False,
+        "clamped": clamped,
+        "source": "profile",
+    }
 
 
 def profiles_age_days() -> float | None:

@@ -8,6 +8,15 @@ from app.derivatives import short_derivatives_text
 from app.news_risk import short_news_text
 from app.position_quality import position_quality_score
 from app.strategy_robustness import get_reliability_score
+from app.volatility_profile import (
+    get_profile,
+    get_entry_levels_for_coin,   # единый источник DCA-уровней (signals + storage)
+    FALLBACK_ENTRY_LEVELS,
+)
+
+
+# Режим EXPANDING поднимает планку score (не блокирует вход) — специфично для сигнала.
+EXPANDING_SCORE_BUMP = 10
 
 
 def get_market_regime(btc_item: dict | None, items: list[dict] | None = None, market_context: dict | None = None) -> dict:
@@ -171,8 +180,11 @@ def classify_signal(item: dict, btc_item: dict | None = None, market_context: di
     dd30 = float(item["drawdown_30d_high"])
     atr = float(item.get("atr_pct", 0) or 0)
     vclass = item.get("volatility_class", "MEDIUM")
-    dca_levels = item.get("dca_levels") or [10, 15, 25, 35]
-    first_level = float(dca_levels[0])
+    # Персональные ATR-уровни входа из профиля волатильности (с защитными границами)
+    # вместо прежних фиксированных dca_levels монеты.
+    vol_levels = get_entry_levels_for_coin(coin)
+    entry_levels = vol_levels["levels"]
+    first_level = float(entry_levels[0])
 
     market_score = int(market_context.get("score", 50)) if market_context else 50
     market_mode = market_context.get("mode", "UNKNOWN") if market_context else "UNKNOWN"
@@ -245,6 +257,17 @@ def classify_signal(item: dict, btc_item: dict | None = None, market_context: di
         score -= 8; reasons.append("экстремальная волатильность: входы только глубже")
     elif vclass == "HIGH":
         score -= 4; reasons.append("высокая волатильность: входы разносить шире")
+
+    # Режим волатильности (короткий vs длинный ATR). EXPANDING не блокирует вход
+    # (жёсткую защиту от аномалии делает coin_health), но поднимает планку score —
+    # фактически требует на +10 более уверенный сигнал. QUIET/NORMAL без изменений.
+    if vol_levels.get("vol_regime") == "EXPANDING":
+        score -= EXPANDING_SCORE_BUMP
+        reasons.append("⚡ повышенная волатильность (режим EXPANDING): беру только уверенные входы")
+    if vol_levels.get("profile_missing"):
+        reasons.append("профиль волатильности отсутствует — уровни входа по дефолту")
+    elif vol_levels.get("clamped"):
+        reasons.append("ATR-уровни входа подрезаны под защитные границы (-2% / -45%)")
 
     # Portfolio-aware additions.
     coin_risk = get_coin_risk(coin)
@@ -342,6 +365,7 @@ def classify_signal(item: dict, btc_item: dict | None = None, market_context: di
         "reliability": reliability,
         "price_attractiveness": price,
         "risk_state": risk,
+        "vol_levels": vol_levels,
     }
 
 
@@ -450,6 +474,32 @@ def _signal_title(status: str) -> str:
     return "⚪ WATCH"
 
 
+def _vol_levels_line(signal: dict) -> str:
+    """Строка с персональными уровнями входа от волатильности монеты."""
+    vl = signal.get("vol_levels") or {}
+    levels = vl.get("levels") or []
+    if len(levels) < 3:
+        return ""
+    if vl.get("profile_missing"):
+        head = "Уровни входа (профиль отсутствует, дефолт)"
+    else:
+        head = f"Уровни от волатильности (класс {vl.get('vol_class')})"
+        if vl.get("vol_regime") == "EXPANDING":
+            head += " ⚡"
+    return f"{head}: т1 -{levels[0]:g}% / т2 -{levels[1]:g}% / т3 -{levels[2]:g}%"
+
+
+def _next_level_text_from_vol(signal: dict, current: float) -> str:
+    """Превью следующего уровня входа от текущей цены по персональным ATR-уровням."""
+    vl = signal.get("vol_levels") or {}
+    levels = vl.get("levels") or []
+    if len(levels) >= 2 and current:
+        level_pct = float(levels[1])
+        next_price = current * (1 - level_pct / 100)
+        return f"${fmt_usdt(next_price)} (-{level_pct:g}%)"
+    return "нет данных"
+
+
 def _signal_card(item: dict, signal: dict, detailed: bool = True) -> str:
     coin = item["coin"]
     pos = get_position(coin)
@@ -470,6 +520,10 @@ def _signal_card(item: dict, signal: dict, detailed: bool = True) -> str:
         f"Цена входа: {(signal.get('price_attractiveness') or {}).get('state','?')}",
         f"Волатильность: {vclass}",
     ]
+
+    vol_line = _vol_levels_line(signal)
+    if vol_line:
+        lines.append(vol_line)
 
     deriv = signal.get("derivatives") or item.get("derivatives") or {}
     news = signal.get("news_risk") or item.get("news_risk") or {}
@@ -668,17 +722,12 @@ def format_compact_signal(item: dict, signal: dict) -> str:
     entry_count = int(pos.get("entry_count", 0)) if pos else 0
     tranche = entry_count + 1
 
-    dca_levels = item.get("dca_levels") or []
     if pos and float(pos.get("next_buy_price", 0) or 0) and current:
         next_price = float(pos["next_buy_price"])
         next_pct = (next_price / current - 1) * 100
         next_text = f"${fmt_usdt(next_price)} ({next_pct:+.1f}%)"
-    elif len(dca_levels) >= 2 and current:
-        level_pct = float(dca_levels[1])
-        next_price = current * (1 - level_pct / 100)
-        next_text = f"${fmt_usdt(next_price)} (-{level_pct:.0f}%)"
     else:
-        next_text = "нет данных"
+        next_text = _next_level_text_from_vol(signal, current)
 
     amount_text = f"${entry_usdt:.0f} USDT" if entry_usdt else "—"
     reasons = signal.get("reasons") or []
@@ -686,15 +735,21 @@ def format_compact_signal(item: dict, signal: dict) -> str:
     if len(short_reason) > 70:
         short_reason = short_reason[:67] + "…"
 
-    return "\n".join([
+    out = [
         f"{emoji} {coin} — {status_label}",
         f"Цена: ${fmt_usdt(current)} | Просадка: {dd30:+.1f}% от 30д high",
         f"Транш {tranche} из 3 | Сумма: {amount_text}",
         f"Следующий уровень: {next_text}",
+    ]
+    vol_line = _vol_levels_line(signal)
+    if vol_line:
+        out.append(vol_line)
+    out += [
         "",
         f"📊 Score: {score}/100 | Волатильность: {vclass}",
         f"💡 {short_reason}",
-    ])
+    ]
+    return "\n".join(out)
 
 
 def format_core_signal(item: dict, signal: dict) -> str:
@@ -710,25 +765,24 @@ def format_core_signal(item: dict, signal: dict) -> str:
     entry_count = int(pos.get("entry_count", 0)) if pos else 0
     tranche = entry_count + 1
 
-    dca_levels = item.get("dca_levels") or []
     if pos and float(pos.get("next_buy_price", 0) or 0) and current:
         next_price = float(pos["next_buy_price"])
         next_pct = (next_price / current - 1) * 100
         next_text = f"${fmt_usdt(next_price)} ({next_pct:+.1f}%)"
-    elif len(dca_levels) >= 2 and current:
-        level_pct = float(dca_levels[1])
-        next_price = current * (1 - level_pct / 100)
-        next_text = f"${fmt_usdt(next_price)} (-{level_pct:.0f}%)"
     else:
-        next_text = "нет данных"
+        next_text = _next_level_text_from_vol(signal, current)
 
     amount_text = f"${entry_usdt:.0f}" if entry_usdt else "—"
     status_label = {"STRONG_BUY": "STRONG BUY"}.get(status, status)
 
-    return "\n".join([
+    out = [
         f"✅ Автовход {coin} — {status_label}",
         f"Сумма: {amount_text} по ${fmt_usdt(current)}",
         f"Транш {tranche} из 3",
         f"Следующий уровень: {next_text}",
         f"Просадка: {dd30:+.1f}% | Score: {score}/100",
-    ])
+    ]
+    vol_line = _vol_levels_line(signal)
+    if vol_line:
+        out.append(vol_line)
+    return "\n".join(out)

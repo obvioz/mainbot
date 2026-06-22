@@ -12,10 +12,10 @@ from app.market import analyze_market, make_exchange, analyze_coin, fetch_ohlcv_
 from app.derivatives import short_derivatives_text
 from app.news_risk import short_news_text
 from app.market_intelligence import build_market_context
-from app.signals import format_signal_report, classify_signal, format_compact_signal, get_market_regime
+from app.signals import format_signal_report, classify_signal, format_compact_signal, get_market_regime, get_entry_levels_for_coin
 from app.portfolio import format_portfolio_plan
 from app.monitor import monitor_loop, STATE_PATH
-from app.storage import record_buy, record_sell, get_open_positions, export_journal_csv, get_position
+from app.storage import record_buy, record_sell, get_open_positions, export_journal_csv, get_position, migrate_positions_to_personal_levels
 from app.formatters import format_positions_report, format_journal, format_stats_report, format_risk_report, format_buy_risk_warning, fmt_usdt, fmt_money
 from app.ui import split_text
 from app.risk_manager import check_buy_risk
@@ -417,10 +417,11 @@ async def cmd_buy(message: Message):
             return
         try:
             market_item = await asyncio.to_thread(analyze_coin, make_exchange(), coin)
-            dca_levels = market_item.get("dca_levels") or None
         except Exception:
-            dca_levels = None
-        pos = record_buy(coin, amount_usdt, price, reason="manual", dca_levels=dca_levels)
+            market_item = None
+        # Лесенку доборов record_buy берёт из персональных ATR-уровней монеты
+        # (единый источник). Старые market dca_levels больше не навязываем.
+        pos = record_buy(coin, amount_usdt, price, reason="manual")
         try:
             add_system_event("BUY", f"Покупка {coin}", data={"coin": coin, "amount_usdt": amount_usdt, "price": price, "avg_price": pos.get("avg_price"), "entry_count": pos.get("entry_count"), "next_buy_price": pos.get("next_buy_price")})
         except Exception:
@@ -441,6 +442,8 @@ async def cmd_buy(message: Message):
                     _trigger, _trigger_pct = f"t2 (-{_levels['t2']}%)", float(_levels["t2"])
                 elif _levels.get("t1") and _dd_abs >= float(_levels["t1"]):
                     _trigger, _trigger_pct = f"t1 (-{_levels['t1']}%)", float(_levels["t1"])
+            _vl = get_entry_levels_for_coin(coin)
+            _tr = int(pos.get("entry_count", 1) or 1)
             _indicators = {
                 "drawdown_pct": _dd90,
                 "score": None,
@@ -449,6 +452,12 @@ async def cmd_buy(message: Message):
                 "news_risk": _news.get("state"),
                 "volatility": _mi.get("volatility_class"),
                 "health": (risk_check.get("health") or {}).get("status"),
+                "vol_class": _vl.get("vol_class"),
+                "vol_regime": _vl.get("vol_regime"),
+                "atr_short_pct": _vl.get("atr_short_pct"),
+                "entry_level_pct": (_vl.get("levels") or [None])[min(_tr - 1, 2)],
+                "clamped": _vl.get("clamped"),
+                "profile_missing": _vl.get("profile_missing"),
             }
             log_spot_buy(
                 symbol=coin,
@@ -1261,6 +1270,7 @@ async def on_callback(call: CallbackQuery):
                     _news = (_market_item.get("news_risk") or {})
                     _dd90 = _market_item.get("drawdown_90d_high")
                     _levels = get_entry_levels(coin)
+                    _vl = get_entry_levels_for_coin(coin)
                     _trigger, _trigger_pct = "сигнал", None
                     if _levels and _dd90 is not None:
                         _dd_abs = abs(float(_dd90))
@@ -1287,6 +1297,12 @@ async def on_callback(call: CallbackQuery):
                             "news_risk": _news.get("state"),
                             "volatility": _market_item.get("volatility_class"),
                             "health": (_risk_check.get("health") or {}).get("status"),
+                            "vol_class": _vl.get("vol_class"),
+                            "vol_regime": _vl.get("vol_regime"),
+                            "atr_short_pct": _vl.get("atr_short_pct"),
+                            "entry_level_pct": (_vl.get("levels") or [None])[min(int(pos.get("entry_count", 1) or 1) - 1, 2)],
+                            "clamped": _vl.get("clamped"),
+                            "profile_missing": _vl.get("profile_missing"),
                         },
                     )
                 except Exception:
@@ -1359,12 +1375,8 @@ async def pending_buy_amount_handler(message: Message):
         if not allowed:
             await message.answer(risk_msg)
             return
-        try:
-            market_item = await asyncio.to_thread(analyze_coin, make_exchange(), coin)
-            dca_levels = market_item.get("dca_levels") or None
-        except Exception:
-            dca_levels = None
-        pos = record_buy(coin, amount_usdt, price, reason="button_signal", dca_levels=dca_levels)
+        # Лесенку доборов record_buy берёт из персональных ATR-уровней монеты.
+        pos = record_buy(coin, amount_usdt, price, reason="button_signal")
         risk_text = format_buy_risk_warning(risk_check)
         await message.answer(
             f"✅ Покупка записана\n\n"
@@ -1712,6 +1724,15 @@ async def main():
 
     bot = Bot(token=settings.telegram_bot_token)
     dp = Dispatcher()
+
+    # Разовая миграция открытых позиций на персональные ATR-уровни доборов
+    # (идемпотентно: уже мигрированные позиции пропускаются).
+    try:
+        migrated = migrate_positions_to_personal_levels()
+        if migrated:
+            print(f"DCA migration: переведено позиций на персональные ATR-уровни: {migrated}")
+    except Exception as exc:
+        print(f"DCA migration пропущена из-за ошибки: {exc}")
 
     # Команды
     dp.message.register(cmd_start, Command("start"))

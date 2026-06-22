@@ -281,13 +281,18 @@ def record_buy(coin: str, amount_usdt: float, price: float, reason: str = "manua
         pos["entry_count"] = int(pos.get("entry_count", 0)) + 1
         pos["last_entry_price"] = price
 
-        # Dynamic DCA: если бот уже посчитал адаптивную лесенку по волатильности,
-        # сохраняем ее в позиции и следующий добор считаем от фактической цены покупки.
+        # Единый источник DCA-уровней всей цепочки (первый вход, превью, доборы):
+        # персональные ATR-уровни монеты из volatility_profile. Явно переданные
+        # dca_levels (тесты/ручной override) имеют приоритет. Следующий добор
+        # считается от фактической цены этой покупки (как и раньше по смыслу).
         if dca_levels:
             clean_levels = [float(x) for x in dca_levels][:4]
-            pos["dca_levels_used"] = clean_levels
+            pos["levels_source"] = pos.get("levels_source") or "explicit"
         else:
-            clean_levels = pos.get("dca_levels_used") or []
+            from app.volatility_profile import get_entry_levels_for_coin
+            clean_levels = [float(x) for x in get_entry_levels_for_coin(coin)["levels"]]
+            pos["levels_source"] = "personal_atr"
+        pos["dca_levels_used"] = clean_levels
 
         idx = int(pos.get("entry_count", 0))
         if clean_levels and idx < len(clean_levels):
@@ -326,6 +331,43 @@ def record_buy(coin: str, amount_usdt: float, price: float, reason: str = "manua
         "reason": reason,
     })
     return pos
+
+
+def migrate_positions_to_personal_levels() -> int:
+    """Перевести лесенку доборов открытых позиций на персональные ATR-уровни.
+
+    Обновляет ТОЛЬКО dca_levels_used / next_buy_drop_pct / next_buy_price — то есть
+    лесенку доборов, не трогая qty / invested_usdt / avg_price (деньги) и не
+    затрагивая реконсиляцию продаж. Идемпотентно по флагу levels_source: уже
+    мигрированные позиции пропускаются. Следующий уровень считается от последней
+    фактической цены входа (last_entry_price), как и в record_buy.
+
+    Возвращает число мигрированных позиций.
+    """
+    from app.volatility_profile import get_entry_levels_for_coin
+
+    def _mut(state: dict) -> int:
+        positions = state.get("positions") or {}
+        migrated = 0
+        for coin, pos in positions.items():
+            if pos.get("levels_source") == "personal_atr":
+                continue
+            levels = [float(x) for x in get_entry_levels_for_coin(coin)["levels"]]
+            pos["dca_levels_used"] = levels
+            entry_count = int(pos.get("entry_count", 0) or 0)
+            anchor = float(pos.get("last_entry_price") or pos.get("avg_price") or 0)
+            if levels and entry_count < len(levels):
+                next_drop = float(levels[entry_count])
+            else:
+                next_drop = get_static_next_dca_drop(coin, entry_count)
+            pos["next_buy_drop_pct"] = next_drop
+            if anchor > 0:
+                pos["next_buy_price"] = round(anchor * (1 - next_drop / 100), 8)
+            pos["levels_source"] = "personal_atr"
+            migrated += 1
+        return migrated
+
+    return update_portfolio(_mut)
 
 
 def record_sell(coin: str, price: float, amount_usdt: float | None = None, sell_all: bool = False) -> dict:
