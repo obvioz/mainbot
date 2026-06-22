@@ -581,9 +581,12 @@ async def monitor_loop(bot: Bot) -> None:
         if now - last_rotation_scan >= ROTATION_INTERVAL_SECONDS:
             try:
                 result = await asyncio.to_thread(rotation_tick)
-                text = format_rotation_event(result)
-                if text:
-                    await bot.send_message(chat_id, text)
+                # Один тик может дать несколько событий (закрытие + новый вход),
+                # т.к. позиций теперь до MAX_CONCURRENT_ROTATION.
+                for ev in result.get("events", [result]):
+                    text = format_rotation_event(ev)
+                    if text:
+                        await bot.send_message(chat_id, text)
                 last_rotation_scan = now
             except Exception as exc:
                 await bot.send_message(chat_id, f"⚠️ Ошибка Rotation Lab: {exc}")

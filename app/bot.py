@@ -1644,28 +1644,29 @@ def build_active_trades_report(price_map: dict[str, float] | None = None) -> str
         lines.append("  нет активной сделки")
     lines.append("")
 
-    # 🔄 ROTATION — crypto pairs, demo
+    # 🔄 ROTATION — crypto pairs, demo (до MAX_CONCURRENT_ROTATION позиций)
     lines.append("🔄 КРИПТОПАРЫ (ротация, демо):")
-    ra = (load_rotation_state() or {}).get("active_trade")
-    if ra:
-        pair = ra.get("pair", "")
-        entry = float(ra.get("entry_price") or 0)
-        parts = pair.split("/")
-        cur = None
-        if len(parts) == 2:
-            base_p = price_map.get(parts[0])
-            quote_p = price_map.get(parts[1])
-            if base_p and quote_p:
-                cur = base_p / quote_p
-        pnl = _directional_pnl_pct("long", entry, cur)
-        pnl_str = f"{pnl:+.1f}%" if pnl is not None else "н/д"
-        cur_str = f"{cur:.8g}" if cur else "—"
-        trailing = "активен" if ra.get("trailing_activated") else "ждёт"
-        lines.append(
-            f"  • {pair}: вход {entry:.8g} | сейчас {cur_str} | "
-            f"PnL {pnl_str} | трейлинг {trailing}"
-        )
-        total += 1
+    rotation_open = (load_rotation_state() or {}).get("open_trades") or []
+    if rotation_open:
+        for ra in rotation_open:
+            pair = ra.get("pair", "")
+            entry = float(ra.get("entry_price") or 0)
+            parts = pair.split("/")
+            cur = None
+            if len(parts) == 2:
+                base_p = price_map.get(parts[0])
+                quote_p = price_map.get(parts[1])
+                if base_p and quote_p:
+                    cur = base_p / quote_p
+            pnl = _directional_pnl_pct("long", entry, cur)
+            pnl_str = f"{pnl:+.1f}%" if pnl is not None else "н/д"
+            cur_str = f"{cur:.8g}" if cur else "—"
+            trailing = "активен" if ra.get("trailing_activated") else "ждёт"
+            lines.append(
+                f"  • {pair}: вход {entry:.8g} | сейчас {cur_str} | "
+                f"PnL {pnl_str} | трейлинг {trailing}"
+            )
+            total += 1
     else:
         lines.append("  нет активной сделки")
     lines.append("")
@@ -1689,8 +1690,8 @@ async def cmd_active(message: Message):
         pa = (await asyncio.to_thread(load_pro_state) or {}).get("active_trade")
         if pa:
             needed.add(_symbol_base(pa.get("symbol", "")))
-        ra = (await asyncio.to_thread(load_rotation_state) or {}).get("active_trade")
-        if ra:
+        rotation_open = (await asyncio.to_thread(load_rotation_state) or {}).get("open_trades") or []
+        for ra in rotation_open:
             needed.update(ra.get("pair", "").split("/"))
         for coin in needed:
             if coin and coin not in price_map:

@@ -16,11 +16,21 @@ ROTATION_KEY = "rotation_lab"
 PAIRS_FILE = Path("data/bybit_pairs.json")
 MAX_PAIRS = 10
 
+# Сколько виртуальных позиций ротации можно держать одновременно.
+MAX_CONCURRENT_ROTATION = 3
+
 DEFAULT_PAIRS = [
     "ETH/BTC",
     "SOL/BTC",
+    "LTC/BTC",
+    "XRP/BTC",
 ]
 
+# Белый список BTC-пар для ротации. Проверено через ccxt на Bybit spot (2026-06):
+# из кандидатов BNB/ADA/AVAX/LINK/DOT — ни одной /BTC пары на Bybit spot нет,
+# поэтому реально доступны только эти четыре (плюс на бирже есть ещё MNT/XLM/BTC,
+# в список пока не включены). Фактический набор торгуемых пар берётся из
+# data/bybit_pairs.json через load_rotation_pairs() и фильтруется по этому списку.
 ALLOWED_ROTATION = [
     "ETH/BTC",
     "SOL/BTC",
@@ -103,7 +113,7 @@ def default_rotation_state() -> dict[str, Any]:
         "base": "BTC",
         "virtual_btc": VIRTUAL_BTC_START,
         "initial_btc": VIRTUAL_BTC_START,
-        "active_trade": None,
+        "open_trades": [],
         "journal": [],
         "last_tick": None,
         "last_event": None,
@@ -111,6 +121,29 @@ def default_rotation_state() -> dict[str, Any]:
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
+
+
+def _migrate_active_trade(lab: dict[str, Any]) -> None:
+    """Совместимость: старое состояние с одиночным active_trade → open_trades.
+
+    Переносит текущую открытую позицию в список, не теряя её. Аллокацию
+    нормализуем к равной доле капитала (virtual_btc / MAX_CONCURRENT), чтобы
+    сразу освободить слоты под новые входы в новой мультипозиционной модели.
+    """
+    legacy = lab.get("active_trade")
+    if legacy:
+        open_trades = lab.setdefault("open_trades", [])
+        already = any(t.get("pair") == legacy.get("pair") for t in open_trades)
+        if not already:
+            # Нормализуем долю к равному слоту (override): старый код хранил
+            # btc_amount = весь баланс, что заняло бы все слоты и заблокировало
+            # новые входы. Приводим к virtual_btc / MAX, освобождая капитал.
+            legacy["btc_amount"] = (
+                float(lab.get("virtual_btc") or VIRTUAL_BTC_START) / MAX_CONCURRENT_ROTATION
+            )
+            open_trades.append(legacy)
+    # Старый ключ больше не источник истины.
+    lab["active_trade"] = None
 
 
 def load_rotation_state() -> dict[str, Any]:
@@ -128,13 +161,16 @@ def load_rotation_state() -> dict[str, Any]:
     lab.setdefault("base", "BTC")
     lab.setdefault("virtual_btc", VIRTUAL_BTC_START)
     lab.setdefault("initial_btc", VIRTUAL_BTC_START)
-    lab.setdefault("active_trade", None)
+    lab.setdefault("open_trades", [])
     lab.setdefault("journal", [])
     lab.setdefault("last_tick", None)
     lab.setdefault("last_event", None)
     lab.setdefault("stop_cooldowns", {})
     lab.setdefault("created_at", now_iso())
     lab.setdefault("updated_at", now_iso())
+
+    # Миграция одиночного active_trade в open_trades (обратная совместимость).
+    _migrate_active_trade(lab)
 
     return lab
 
@@ -262,10 +298,15 @@ def _is_on_cooldown(lab: dict[str, Any], pair: str) -> bool:
         return False
 
 
-def find_best_pair(exchange, lab: dict[str, Any] | None = None) -> dict[str, Any] | None:
+def find_best_pair(
+    exchange,
+    lab: dict[str, Any] | None = None,
+    pairs: list[str] | None = None,
+) -> dict[str, Any] | None:
     candidates: list[dict[str, Any]] = []
 
-    for pair in load_rotation_pairs("BTC"):
+    pairs = pairs if pairs is not None else load_rotation_pairs("BTC")
+    for pair in pairs:
         if lab is not None and _is_on_cooldown(lab, pair):
             continue
         try:
@@ -298,11 +339,27 @@ def _append_journal(lab: dict[str, Any], row: dict[str, Any]) -> None:
     lab["last_event"] = row
 
 
+def _reserved_btc(lab: dict[str, Any]) -> float:
+    """Сумма BTC, уже зарезервированная под открытые позиции."""
+    return sum(float(t.get("btc_amount") or 0) for t in (lab.get("open_trades") or []))
+
+
+def _free_btc(lab: dict[str, Any]) -> float:
+    """Свободный (незарезервированный) виртуальный BTC."""
+    return float(lab.get("virtual_btc") or 0) - _reserved_btc(lab)
+
+
 def open_virtual_trade(lab: dict[str, Any], pair_data: dict[str, Any]) -> dict[str, Any]:
     btc_before = float(lab["virtual_btc"])
     atr = float(pair_data.get("atr") or 0)
     entry_price = float(pair_data["price"])
     initial_stop = entry_price - ATR_MULTIPLIER * atr
+
+    # Капитал делим между слотами: новая позиция берёт равную долю от СВОБОДНОГО
+    # баланса, чтобы одна и та же сумма не считалась в нескольких позициях.
+    open_trades = lab.setdefault("open_trades", [])
+    slots_remaining = max(MAX_CONCURRENT_ROTATION - len(open_trades), 1)
+    alloc = _free_btc(lab) / slots_remaining
 
     trade: dict[str, Any] = {
         "pair": pair_data["pair"],
@@ -317,11 +374,11 @@ def open_virtual_trade(lab: dict[str, Any], pair_data: dict[str, Any]) -> dict[s
         "entry_uptrend": bool(pair_data.get("uptrend", False)),
         "entry_volume_ratio": float(pair_data.get("volume_ratio") or 0),
         "entry_reasons": pair_data.get("reasons") or [],
-        "btc_amount": btc_before,
+        "btc_amount": alloc,
         "opened_at": now_iso(),
     }
 
-    lab["active_trade"] = trade
+    open_trades.append(trade)
 
     atr_pct = atr / entry_price * 100 if entry_price > 0 else 0.0
     _append_journal(lab, {
@@ -335,6 +392,7 @@ def open_virtual_trade(lab: dict[str, Any], pair_data: dict[str, Any]) -> dict[s
         "atr_at_entry": atr,
         "btc_before": btc_before,
         "btc_after": btc_before,
+        "alloc_btc": alloc,
         "score": trade["entry_score"],
         "pullback_pct": trade["entry_pullback_pct"],
         "entry_reason": {
@@ -357,8 +415,9 @@ def open_virtual_trade(lab: dict[str, Any], pair_data: dict[str, Any]) -> dict[s
     return lab
 
 
-def close_virtual_trade(lab: dict[str, Any], exit_price: float, reason: str) -> dict[str, Any]:
-    trade = lab.get("active_trade")
+def close_virtual_trade(
+    lab: dict[str, Any], trade: dict[str, Any], exit_price: float, reason: str
+) -> dict[str, Any]:
     if not trade:
         return lab
 
@@ -369,7 +428,10 @@ def close_virtual_trade(lab: dict[str, Any], exit_price: float, reason: str) -> 
         return lab
 
     result_pct = (float(exit_price) / entry_price - 1) * 100
-    btc_after = btc_before * (1 + result_pct / 100)
+    # PnL начисляется только на долю капитала этой позиции (alloc), а не на весь
+    # баланс — иначе одна и та же сумма считалась бы в нескольких позициях.
+    alloc = float(trade.get("btc_amount") or 0)
+    btc_after = btc_before + alloc * result_pct / 100
     lab["virtual_btc"] = btc_after
 
     highest_price = float(trade.get("highest_price") or entry_price)
@@ -407,6 +469,7 @@ def close_virtual_trade(lab: dict[str, Any], exit_price: float, reason: str) -> 
         "result_pct": result_pct,
         "btc_before": btc_before,
         "btc_after": btc_after,
+        "alloc_btc": alloc,
         "reason": reason,
         "highest_price_reached": highest_price,
         "trailing_activated": trailing_activated,
@@ -418,8 +481,75 @@ def close_virtual_trade(lab: dict[str, Any], exit_price: float, reason: str) -> 
     if reason in ("stop_loss", "trailing_stop") and result_pct < 0:
         lab.setdefault("stop_cooldowns", {})[trade["pair"]] = now_iso()
 
-    lab["active_trade"] = None
+    # Удаляем именно эту позицию из списка открытых (по идентичности объекта,
+    # с подстраховкой по pair+opened_at).
+    lab["open_trades"] = [
+        t for t in (lab.get("open_trades") or [])
+        if t is not trade
+        and not (t.get("pair") == trade.get("pair") and t.get("opened_at") == trade.get("opened_at"))
+    ]
     return lab
+
+
+def _service_open_trade(
+    lab: dict[str, Any], exchange, trade: dict[str, Any]
+) -> dict[str, Any]:
+    """Обслужить одну открытую позицию: трейлинг и проверка стопа.
+
+    Возвращает event-словарь со status "closed" или "holding".
+    При закрытии мутирует lab (virtual_btc, open_trades) через close_virtual_trade.
+    """
+    pair = trade["pair"]
+    current_price = fetch_pair_price(exchange, pair)
+    entry_price = float(trade["entry_price"])
+    atr = float(trade.get("atr") or 0)
+    result_pct = (current_price / entry_price - 1) * 100 if entry_price else 0.0
+
+    if atr > 0:
+        highest = max(float(trade.get("highest_price") or entry_price), current_price)
+        trade["highest_price"] = highest
+
+        trail_activation = entry_price + ATR_MULTIPLIER * atr
+        if current_price >= trail_activation:
+            trade["trailing_activated"] = True
+
+        if trade.get("trailing_activated"):
+            new_trail = highest - ATR_MULTIPLIER * atr
+            current_trail = float(trade.get("trailing_stop") or trade.get("initial_stop") or 0)
+            trade["trailing_stop"] = max(new_trail, current_trail)
+
+    stop = float(trade.get("trailing_stop") or trade.get("initial_stop") or 0)
+
+    if stop > 0 and current_price <= stop:
+        reason = "trailing_stop" if trade.get("trailing_activated") else "stop_loss"
+        close_virtual_trade(lab, trade, current_price, reason)
+        last_event = lab.get("last_event") or {}
+        return {
+            "status": "closed",
+            "reason": reason,
+            "pair": pair,
+            "result_pct": result_pct,
+            "virtual_btc": float(lab["virtual_btc"]),
+            "btc_before": last_event.get("btc_before"),
+            "btc_after": last_event.get("btc_after"),
+            "event": last_event,
+        }
+
+    return {
+        "status": "holding",
+        "pair": pair,
+        "result_pct": result_pct,
+        "trailing_activated": trade.get("trailing_activated", False),
+        "trailing_stop": trade.get("trailing_stop"),
+        "virtual_btc": float(lab["virtual_btc"]),
+    }
+
+
+def _overall_status(events: list[dict[str, Any]]) -> str:
+    for s in ("opened", "closed", "holding"):
+        if any(e.get("status") == s for e in events):
+            return s
+    return "idle"
 
 
 def rotation_tick() -> dict[str, Any]:
@@ -432,80 +562,45 @@ def rotation_tick() -> dict[str, Any]:
         save_rotation_state(lab)
         return {
             "status": "disabled",
+            "events": [],
+            "open_count": len(lab.get("open_trades") or []),
             "virtual_btc": float(lab.get("virtual_btc") or 0),
         }
 
-    active = lab.get("active_trade")
+    events: list[dict[str, Any]] = []
 
-    if active:
-        pair = active["pair"]
-        current_price = fetch_pair_price(exchange, pair)
-        entry_price = float(active["entry_price"])
-        atr = float(active.get("atr") or 0)
-        result_pct = (current_price / entry_price - 1) * 100 if entry_price else 0.0
+    # 1. Сначала обслуживаем все открытые позиции (итерируем по копии, т.к.
+    #    закрытие мутирует open_trades).
+    for trade in list(lab.get("open_trades") or []):
+        try:
+            events.append(_service_open_trade(lab, exchange, trade))
+        except Exception as exc:
+            events.append({"status": "error", "pair": trade.get("pair"), "error": str(exc)})
 
-        if atr > 0:
-            highest = max(float(active.get("highest_price") or entry_price), current_price)
-            active["highest_price"] = highest
-
-            trail_activation = entry_price + ATR_MULTIPLIER * atr
-            if current_price >= trail_activation:
-                active["trailing_activated"] = True
-
-            if active.get("trailing_activated"):
-                new_trail = highest - ATR_MULTIPLIER * atr
-                current_trail = float(active.get("trailing_stop") or active.get("initial_stop") or 0)
-                active["trailing_stop"] = max(new_trail, current_trail)
-
-            lab["active_trade"] = active
-
-        stop = float(active.get("trailing_stop") or active.get("initial_stop") or 0)
-
-        if stop > 0 and current_price <= stop:
-            reason = "trailing_stop" if active.get("trailing_activated") else "stop_loss"
-            lab = close_virtual_trade(lab, current_price, reason)
-            save_rotation_state(lab)
-            last_event = lab.get("last_event") or {}
-            return {
-                "status": "closed",
-                "reason": reason,
-                "pair": pair,
-                "result_pct": result_pct,
+    # 2. Если есть свободный слот — ищем вход среди СВОБОДНЫХ пар (не в позиции).
+    open_pairs = {t.get("pair") for t in (lab.get("open_trades") or [])}
+    if len(lab.get("open_trades") or []) < MAX_CONCURRENT_ROTATION:
+        free_pairs = [p for p in load_rotation_pairs("BTC") if p not in open_pairs]
+        best = find_best_pair(exchange, lab, free_pairs)
+        if best:
+            open_virtual_trade(lab, best)
+            events.append({
+                "status": "opened",
+                "pair": best["pair"],
+                "score": best.get("score"),
+                "pullback_pct": best.get("pullback_pct"),
+                "atr": best.get("atr"),
+                "uptrend": best.get("uptrend"),
                 "virtual_btc": float(lab["virtual_btc"]),
-                "btc_before": last_event.get("btc_before"),
-                "btc_after": last_event.get("btc_after"),
-                "event": last_event,
-            }
-
-        save_rotation_state(lab)
-        return {
-            "status": "holding",
-            "pair": pair,
-            "result_pct": result_pct,
-            "trailing_activated": active.get("trailing_activated", False),
-            "trailing_stop": active.get("trailing_stop"),
-            "virtual_btc": float(lab["virtual_btc"]),
-        }
-
-    best = find_best_pair(exchange, lab)
-
-    if best:
-        lab = open_virtual_trade(lab, best)
-        save_rotation_state(lab)
-        return {
-            "status": "opened",
-            "pair": best["pair"],
-            "score": best.get("score"),
-            "pullback_pct": best.get("pullback_pct"),
-            "atr": best.get("atr"),
-            "uptrend": best.get("uptrend"),
-            "virtual_btc": float(lab["virtual_btc"]),
-            "event": lab.get("last_event"),
-        }
+                "event": lab.get("last_event"),
+            })
 
     save_rotation_state(lab)
+
     return {
-        "status": "idle",
+        "status": _overall_status(events),
+        "events": events,
+        "open_count": len(lab.get("open_trades") or []),
         "virtual_btc": float(lab.get("virtual_btc") or 0),
     }
 
@@ -566,7 +661,8 @@ def rotation_summary() -> str:
     wins = [x for x in closed if float(x.get("result_pct") or 0) > 0]
     losses = [x for x in closed if float(x.get("result_pct") or 0) <= 0]
     winrate = len(wins) / len(closed) * 100 if closed else 0.0
-    active = lab.get("active_trade")
+    open_trades = lab.get("open_trades") or []
+    free_btc = _free_btc(lab)
 
     lines = [
         "🧪 ROTATION LAB",
@@ -586,23 +682,27 @@ def rotation_summary() -> str:
         f"Последний тик: {lab.get('last_tick') or 'нет'}",
     ]
 
-    if active:
-        trailing_activated = active.get("trailing_activated", False)
-        trailing_status = "активен" if trailing_activated else "ждёт"
-        trailing_stop = float(active.get("trailing_stop") or 0)
-        lines += [
-            "",
-            "Активная сделка:",
-            f"Пара: {active['pair']}",
-            f"Вход: {active['entry_price']}",
-            f"Score: {active.get('entry_score', 0)}",
-            f"Откат при входе: {float(active.get('entry_pullback_pct') or 0):+.2f}%",
-            f"ATR: {float(active.get('atr') or 0):.6f}",
-            f"Трейлинг: {trailing_status} | стоп {trailing_stop:.6f}",
-            f"Открыта: {active['opened_at']}",
-        ]
+    lines += [
+        "",
+        f"Открытые позиции: {len(open_trades)}/{MAX_CONCURRENT_ROTATION} "
+        f"(свободно BTC: {free_btc:.8f})",
+    ]
+
+    if open_trades:
+        for i, t in enumerate(open_trades, 1):
+            trailing_status = "активен" if t.get("trailing_activated", False) else "ждёт"
+            trailing_stop = float(t.get("trailing_stop") or 0)
+            lines += [
+                "",
+                f"  [{i}] {t['pair']}",
+                f"      Вход: {t['entry_price']} | Score: {t.get('entry_score', 0)}",
+                f"      Откат при входе: {float(t.get('entry_pullback_pct') or 0):+.2f}%",
+                f"      Доля BTC: {float(t.get('btc_amount') or 0):.8f} | ATR: {float(t.get('atr') or 0):.6f}",
+                f"      Трейлинг: {trailing_status} | стоп {trailing_stop:.6f}",
+                f"      Открыта: {t['opened_at']}",
+            ]
     else:
-        lines += ["", "Активная сделка: нет"]
+        lines += ["Активных сделок нет"]
 
     return "\n".join(lines)
 
