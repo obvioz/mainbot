@@ -57,6 +57,18 @@ VOL_GUARD_ATR_MULT = 2.0           # block new shorts if latest ATR > this * ave
 REGIME_EMA_PERIOD = 50             # EMA period (1h) used for market-regime filter
 REGIME_SLOPE_LOOKBACK = 3          # candles back to measure EMA50 slope
 
+# ─── Macro trend-direction filter (4h EMA50/EMA200) ────────────────────────────
+# Strict direction gate built on real futures_lab data: longs won 20% (-$43),
+# shorts won 67% (+$130). We only take a side when BOTH the BTC barometer and the
+# traded coin agree on a 4h trend. Sideways (FLAT) on either → stand aside.
+BTC_SYMBOL = "BTC/USDT:USDT"        # market barometer
+REGIME_TIMEFRAME = "4h"
+REGIME_EMA_FAST = 50                # 4h fast EMA
+REGIME_EMA_SLOW = 200               # 4h slow EMA (trend backbone)
+REGIME_CANDLE_LIMIT = 320           # enough history for EMA200 + slope lookback
+REGIME_MACRO_SLOPE_LOOKBACK = 3     # 4h candles back to measure EMA50 slope
+REGIME_REFRESH_HOURS = 1            # recompute the macro regime at most once per hour
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -102,6 +114,115 @@ def _entry_allowed_by_regime(side: str, regime: str) -> bool:
     if side == "short" and regime == "uptrend":
         return False
     return True
+
+
+# ─── Macro 4h direction filter (UP / DOWN / FLAT) ──────────────────────────────
+
+def _classify_macro_regime(
+    price: float, ema50: float, ema50_prev: float, ema200: float
+) -> str:
+    """4h trend direction from price vs EMA200, EMA50 slope, and EMA50 vs EMA200.
+
+    UP:   price > EMA200 AND EMA50 rising AND EMA50 > EMA200
+    DOWN: price < EMA200 AND EMA50 falling AND EMA50 < EMA200
+    FLAT: anything mixed (stand aside).
+    """
+    if any(math.isnan(x) for x in (price, ema50, ema50_prev, ema200)):
+        return "FLAT"
+    slope = ema50 - ema50_prev
+    if price > ema200 and slope > 0 and ema50 > ema200:
+        return "UP"
+    if price < ema200 and slope < 0 and ema50 < ema200:
+        return "DOWN"
+    return "FLAT"
+
+
+def _direction_filter_block(side: str, btc_regime: str, coin_regime: str) -> str | None:
+    """Double trend filter. Returns a block reason, or None if the entry is allowed.
+
+    LONG only when btc == UP AND coin == UP; SHORT only when btc == DOWN AND coin == DOWN.
+    Reasons:
+      flat_market          — BTC barometer is sideways (whole market FLAT)
+      btc_coin_divergence  — BTC trends but the coin disagrees (opposite or FLAT)
+      regime_mismatch      — both agree on a trend, but it's against the trade side
+    """
+    want = "UP" if side == "long" else "DOWN"
+    if btc_regime == want and coin_regime == want:
+        return None
+    if btc_regime == "FLAT":
+        return "flat_market"
+    if coin_regime == "FLAT" or btc_regime != coin_regime:
+        return "btc_coin_divergence"
+    return "regime_mismatch"
+
+
+def _allowed_now(btc_regime: str, coin_regime: str) -> str:
+    """Human-readable summary of what the direction filter permits for a coin."""
+    if _direction_filter_block("long", btc_regime, coin_regime) is None:
+        return "лонги"
+    if _direction_filter_block("short", btc_regime, coin_regime) is None:
+        return "шорты"
+    return "ничего"
+
+
+def market_regime_analysis(exchange, symbol: str) -> dict[str, Any]:
+    """Compute the 4h macro regime (UP/DOWN/FLAT) for a symbol via EMA50/EMA200."""
+    try:
+        candles = exchange.fetch_ohlcv(symbol, timeframe=REGIME_TIMEFRAME, limit=REGIME_CANDLE_LIMIT)
+    except Exception as exc:
+        return {"symbol": symbol, "regime": "FLAT", "error": str(exc)}
+
+    if not candles or len(candles) < REGIME_EMA_SLOW + REGIME_MACRO_SLOPE_LOOKBACK + 1:
+        return {"symbol": symbol, "regime": "FLAT", "error": "insufficient_data"}
+
+    closes = [float(c[4]) for c in candles]
+    price = closes[-1]
+    ema_fast = _compute_ema(closes, REGIME_EMA_FAST)
+    ema_slow = _compute_ema(closes, REGIME_EMA_SLOW)
+
+    ema50 = ema_fast[-1]
+    ema50_prev = ema_fast[-1 - REGIME_MACRO_SLOPE_LOOKBACK]
+    ema200 = ema_slow[-1]
+    regime = _classify_macro_regime(price, ema50, ema50_prev, ema200)
+
+    return {
+        "symbol": symbol,
+        "regime": regime,
+        "price": round(price, 4),
+        "ema50": round(ema50, 4) if not math.isnan(ema50) else None,
+        "ema200": round(ema200, 4) if not math.isnan(ema200) else None,
+        "ema50_slope": round(ema50 - ema50_prev, 6) if not math.isnan(ema50 - ema50_prev) else None,
+    }
+
+
+def _get_macro_regimes(
+    exchange, lab: dict[str, Any], now: datetime, force: bool = False
+) -> dict[str, Any]:
+    """Hourly-cached macro regimes for BTC + every traded symbol.
+
+    Recomputes at most once per REGIME_REFRESH_HOURS (cache key: last_regime_update).
+    """
+    cache = lab.get("macro_regime") or {}
+    last = _parse_iso(lab.get("last_regime_update"))
+    fresh = (
+        last is not None
+        and (now - last) < timedelta(hours=REGIME_REFRESH_HOURS)
+        and bool(cache.get("coins"))
+    )
+    if fresh and not force:
+        return cache
+
+    coins: dict[str, str] = {}
+    for sym in SYMBOLS:
+        coins[sym] = market_regime_analysis(exchange, sym).get("regime", "FLAT")
+    btc = coins.get(BTC_SYMBOL)
+    if btc is None:
+        btc = market_regime_analysis(exchange, BTC_SYMBOL).get("regime", "FLAT")
+
+    cache = {"btc": btc, "coins": coins}
+    lab["macro_regime"] = cache
+    lab["last_regime_update"] = now.isoformat()
+    return cache
 
 
 def _short_pump_pct(candles: list, current_price: float) -> float:
@@ -312,6 +433,9 @@ def default_futures_state() -> dict[str, Any]:
         "losses_cooldown_until": None,
         "stop_cooldowns": {},
         "blocked_entries": [],
+        # Macro 4h direction filter cache (refreshed hourly)
+        "macro_regime": {},
+        "last_regime_update": None,
         "created_at": now_iso(),
         "updated_at": now_iso(),
     }
@@ -341,6 +465,8 @@ def load_futures_state() -> dict[str, Any]:
     lab.setdefault("losses_cooldown_until", None)
     lab.setdefault("stop_cooldowns", {})
     lab.setdefault("blocked_entries", [])
+    lab.setdefault("macro_regime", {})
+    lab.setdefault("last_regime_update", None)
 
     return lab
 
@@ -724,10 +850,16 @@ def _open_trade(
     )
 
     regime = signal.get("regime", "range")
+    btc_regime = signal.get("btc_regime")
+    coin_regime = signal.get("coin_regime")
     consecutive_losses = int(lab.get("consecutive_losses") or 0)
     day_loss_pct = round(_current_day_loss_pct(lab), 3)
     entry_reason = dict(signal.get("entry_reason") or {})
     entry_reason["market_regime"] = regime
+    if btc_regime is not None:
+        entry_reason["btc_regime"] = btc_regime
+    if coin_regime is not None:
+        entry_reason["coin_regime"] = coin_regime
 
     risk_fields = {
         "score": score,
@@ -753,6 +885,8 @@ def _open_trade(
         "deposit_before": deposit,
         "entry_reason": entry_reason,
         "market_regime": regime,
+        "btc_regime": btc_regime,
+        "coin_regime": coin_regime,
         "consecutive_losses": consecutive_losses,
         "day_loss_pct": day_loss_pct,
         "atr": atr,
@@ -779,6 +913,8 @@ def _open_trade(
         "deposit_before": deposit,
         "entry_reason": entry_reason,
         "market_regime": regime,
+        "btc_regime": btc_regime,
+        "coin_regime": coin_regime,
         "consecutive_losses": consecutive_losses,
         "day_loss_pct": day_loss_pct,
         "opened_at": trade["opened_at"],
@@ -839,6 +975,8 @@ def _close_trade(
         "leverage": LEVERAGE,
         "entry_reason": trade.get("entry_reason", {}),
         "market_regime": trade.get("market_regime"),
+        "btc_regime": trade.get("btc_regime"),
+        "coin_regime": trade.get("coin_regime"),
         # Carry entry-time score/risk onto the outcome row for offline factor analysis.
         "score": trade.get("score"),
         "score_components": trade.get("score_components"),
@@ -1078,11 +1216,27 @@ def futures_tick() -> dict[str, Any]:
             "notifications": notifications,
         }
 
+    # Macro 4h direction filter (hourly cached): both BTC and the coin must agree
+    # on a trend before any entry. FLAT on either → stand aside (sideways market).
+    regimes = _get_macro_regimes(exchange, lab, now)
+    btc_regime = regimes.get("btc", "FLAT")
+    coin_regimes = regimes.get("coins") or {}
+
     # Scan for entry signals; pick the first that passes per-signal filters
     signals = _scan_for_signals(exchange)
     chosen = None
     blocked: list[dict[str, Any]] = []
     for sig in signals:
+        coin_regime = coin_regimes.get(sig["symbol"], "FLAT")
+        # NEW: strict trend-direction gate, applied on top of the existing breakers.
+        dblock = _direction_filter_block(sig["side"], btc_regime, coin_regime)
+        if dblock:
+            _log_blocked_entry(
+                lab, sig["symbol"], sig["side"], sig["strategy"],
+                f"btc={btc_regime}/coin={coin_regime}", dblock,
+            )
+            blocked.append({"symbol": sig["symbol"], "side": sig["side"], "reason": dblock})
+            continue
         sblock = _signal_entry_block(lab, sig, now)
         if sblock:
             _log_blocked_entry(
@@ -1090,6 +1244,9 @@ def futures_tick() -> dict[str, Any]:
             )
             blocked.append({"symbol": sig["symbol"], "side": sig["side"], "reason": sblock})
             continue
+        # Tag the chosen signal with the macro regimes for journaling.
+        sig["btc_regime"] = btc_regime
+        sig["coin_regime"] = coin_regime
         chosen = sig
         break
 
@@ -1134,6 +1291,8 @@ def futures_tick() -> dict[str, Any]:
             "symbol": chosen["symbol"],
             "side": chosen["side"],
             "regime": chosen.get("regime"),
+            "btc_regime": chosen.get("btc_regime"),
+            "coin_regime": chosen.get("coin_regime"),
             "score": chosen.get("score"),
             "assigned_risk_pct": assigned_risk,
             "actual_risk_pct": actual_risk,
@@ -1150,6 +1309,8 @@ def futures_tick() -> dict[str, Any]:
         "status": "idle",
         "virtual_usdt": float(lab.get("virtual_usdt") or 0),
         "signals_checked": len(SYMBOLS) * len(_STRATEGY_FINDERS),
+        "btc_regime": btc_regime,
+        "coin_regimes": coin_regimes,
         "blocked_entries": blocked,
         "notifications": notifications,
     }
@@ -1303,10 +1464,40 @@ def circuit_status() -> str:
     else:
         lines.append("Открытые позиции: нет")
 
-    # Live market regimes for the watched symbols
-    lines += ["", "Режим рынка (EMA50 1ч):"]
+    # Macro direction filter (4h EMA50/EMA200) — the strict trend gate on new entries
+    exchange = None
     try:
         exchange = make_futures_exchange()
+    except Exception as exc:
+        lines += ["", f"Фильтр тренда (4ч): ошибка биржи: {exc}"]
+
+    if exchange is not None:
+        try:
+            btc_info = market_regime_analysis(exchange, BTC_SYMBOL)
+            btc_regime = btc_info.get("regime", "FLAT")
+            lines += [
+                "",
+                "🧭 Фильтр направления (4ч EMA50/EMA200):",
+                f"  BTC (барометр): {btc_regime}",
+            ]
+            for symbol in SYMBOLS:
+                try:
+                    info = (
+                        btc_info if symbol == BTC_SYMBOL
+                        else market_regime_analysis(exchange, symbol)
+                    )
+                    coin_regime = info.get("regime", "FLAT")
+                    allowed = _allowed_now(btc_regime, coin_regime)
+                    lines.append(f"  {symbol}: {coin_regime} → разрешено: {allowed}")
+                except Exception as exc:
+                    lines.append(f"  {symbol}: ошибка {exc}")
+            if btc_regime == "FLAT":
+                lines.append("  ⚠️ BTC в боковике — новые входы остановлены по всем монетам")
+        except Exception as exc:
+            lines.append(f"  ошибка фильтра тренда: {exc}")
+
+        # Live market regimes for the watched symbols (1h EMA50 — legacy soft filter)
+        lines += ["", "Режим рынка (EMA50 1ч):"]
         for symbol in SYMBOLS:
             try:
                 data = _analyze_symbol(exchange, symbol)
@@ -1324,8 +1515,6 @@ def circuit_status() -> str:
                 )
             except Exception as exc:
                 lines.append(f"  {symbol}: ошибка {exc}")
-    except Exception as exc:
-        lines.append(f"  ошибка биржи: {exc}")
 
     # Recent blocked entries
     blocked = lab.get("blocked_entries") or []
@@ -1424,7 +1613,7 @@ def export_futures_csv(days: int = 30) -> Path:
 
     fieldnames = [
         "strategy", "side", "symbol",
-        "market_regime", "consecutive_losses", "day_loss_pct",
+        "market_regime", "btc_regime", "coin_regime", "consecutive_losses", "day_loss_pct",
         "score", "sc_trend", "sc_magnitude", "sc_regime", "sc_volatility",
         "assigned_risk_pct", "actual_risk_pct", "was_trimmed", "portfolio_risk_before",
         "entry_price", "stop_price", "take_profit_price", "liquidation_price",
@@ -1448,6 +1637,8 @@ def export_futures_csv(days: int = 30) -> Path:
                 "side": row.get("side"),
                 "symbol": row.get("symbol"),
                 "market_regime": row.get("market_regime"),
+                "btc_regime": row.get("btc_regime"),
+                "coin_regime": row.get("coin_regime"),
                 "consecutive_losses": row.get("consecutive_losses"),
                 "day_loss_pct": row.get("day_loss_pct"),
                 "score": row.get("score"),
@@ -1526,10 +1717,17 @@ def format_futures_event(event: dict[str, Any] | None) -> str | None:
                 f"(тренд {sc.get('trend', '?')}, объём {sc.get('magnitude', '?')}, "
                 f"режим {sc.get('regime', '?')}, волат {sc.get('volatility', '?')})\n"
             )
+        regime_line = ""
+        if event.get("btc_regime") is not None or event.get("coin_regime") is not None:
+            regime_line = (
+                f"Тренд 4ч: BTC {event.get('btc_regime', '?')} / "
+                f"монета {event.get('coin_regime', '?')}\n"
+            )
         return (
             "📈 FUTURES DEMO ENTRY\n\n"
             f"Пара: {symbol} | {event.get('side', '').upper()}\n"
             f"Стратегия: {event.get('strategy')}\n"
+            f"{regime_line}"
             f"{score_line}"
             f"Вход: {event.get('entry_price')}\n"
             f"Стоп: {event.get('stop_price')}\n"
