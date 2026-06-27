@@ -10,6 +10,9 @@ from app.storage import now_iso
 
 STATE_PATH = Path("data/bybit_portfolio_monitor.json")
 
+# Не уведомлять о продаже, если остаток монеты после продажи ниже этого порога (пыль)
+MIN_SELL_NOTIFY_USDT = 1.0
+
 
 def _read_state() -> dict:
     if not STATE_PATH.exists():
@@ -100,11 +103,13 @@ def check_bybit_portfolio_changes(sync_local: bool = True) -> list[str]:
             )
             continue
         if prev and not cur:
-            messages.append(
-                "✅ Позиция исчезла с Bybit\n\n"
-                f"{coin}\n"
-                "Вероятно, позиция закрыта. Локальный портфель будет обновлен."
-            )
+            # Полная продажа: уведомляем только если позиция была заметной (> порога)
+            if float(prev.get("current_value") or 0) >= MIN_SELL_NOTIFY_USDT:
+                messages.append(
+                    "✅ Позиция исчезла с Bybit\n\n"
+                    f"{coin}\n"
+                    "Вероятно, позиция закрыта. Локальный портфель будет обновлен."
+                )
             continue
         if not prev or not cur:
             continue
@@ -125,6 +130,9 @@ def check_bybit_portfolio_changes(sync_local: bool = True) -> list[str]:
                 "Локальный портфель будет обновлен, DCA пересчитается."
             )
         elif change_pct < -0.5:
+            # Не уведомлять, если остаток после продажи — пыль (< порога)
+            if float(cur.get("current_value") or 0) < MIN_SELL_NOTIFY_USDT:
+                continue
             messages.append(
                 "🔵 Обнаружена продажа на Bybit\n\n"
                 f"{coin}\n"
@@ -134,31 +142,9 @@ def check_bybit_portfolio_changes(sync_local: bool = True) -> list[str]:
                 "Локальный портфель будет обновлен."
             )
 
-    # TP / DCA hints from current snapshot (cooldown based on state alerts)
-    alerts = state.setdefault("alerts", {})
-    for coin, cur in current_assets.items():
-        avg = float(cur.get("avg_price") or 0)
-        price = float(cur.get("current_price") or 0)
-        pnl = float(cur.get("pnl_pct") or 0)
-        if avg <= 0 or price <= 0:
-            continue
-        # Conservative TP alerts. Local bot has detailed category TP, here quick Bybit safety alerts.
-        for level in (10, 15, 25):
-            key = f"{coin}:tp:{level}"
-            if pnl >= level and not alerts.get(key):
-                messages.append(
-                    f"🎯 {coin}: достигнута зона фиксации +{level}%\n\n"
-                    f"Средняя: {fmt_usdt(avg)} USDT\n"
-                    f"Текущая: {fmt_usdt(price)} USDT\n"
-                    f"PnL: {pnl:+.2f}%\n\n"
-                    "Можно рассмотреть частичную продажу."
-                )
-                alerts[key] = True
-        # reset TP flags if price falls back significantly
-        for level in (10, 15, 25):
-            key = f"{coin}:tp:{level}"
-            if pnl < level - 3:
-                alerts.pop(key, None)
+    # Уведомления о фиксации прибыли (TP) намеренно НЕ шлём отсюда: единственный
+    # источник TP-алертов — advisory TP1 +9% в monitor.py (с cooldown и фильтром
+    # пыли). Этот модуль отвечает только за детекцию покупок/продаж и синк.
 
     if sync_local:
         try:
@@ -170,7 +156,6 @@ def check_bybit_portfolio_changes(sync_local: bool = True) -> list[str]:
         "initialized": True,
         "assets": current_assets,
         "quote": quote,
-        "alerts": alerts,
         "updated_at": now_iso(),
     })
     return messages

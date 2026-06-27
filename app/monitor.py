@@ -12,8 +12,6 @@ from app.signals import classify_signal, format_compact_signal, format_core_sign
 from app.settings import settings
 from app.storage import get_position, update_portfolio
 from app.formatters import fmt_usdt, fmt_money
-from app.strategy_params import get_tp_levels
-from app.config import CATEGORIES
 from app.error_log import log_error
 from app.spot_journal import log_spot_sell
 from app.market_intelligence import build_market_context
@@ -35,6 +33,7 @@ VOLPROFILE_INTERVAL_SECONDS = 6 * 3600
 
 TRAILING_TP1_PCT = 9.0      # % роста от средней для активации трейлинга
 TRAILING_TP1_SHARE = 0.40   # доля позиции, которую рекомендуем закрыть на TP1
+MIN_POSITION_VALUE_USDT = 1.0  # позиции дешевле — пыль: не шлём TP/трейлинг алерты
 
 MIN_SIGNAL_SCORE = 70       # сигналы ниже этого score не отправляются
 MIN_ENTRY_USDT = 10.0       # минимальный размер транша для нового входа
@@ -171,9 +170,7 @@ def _scan_positions(state: dict, items: list[dict]) -> tuple[list[str], list[dic
         avg = float(pos.get("avg_price", 0))
         next_buy = float(pos.get("next_buy_price", 0))
         qty = float(pos.get("qty", 0))
-        invested = float(pos.get("invested_usdt", pos.get("invested_rub", 0)))
         value = qty * price
-        pnl = value - invested
         pnl_pct = (price / avg - 1) * 100 if avg else 0
 
         if next_buy and price <= next_buy:
@@ -189,32 +186,11 @@ def _scan_positions(state: dict, items: list[dict]) -> tuple[list[str], list[dic
                     f"Пример: /buy {coin} 10 {fmt_usdt(price)}"
                 )
 
-        category = CATEGORIES.get(coin, "STRONG_ALT")
-        tp_levels = get_tp_levels(coin)
-        tp1 = float(tp_levels[0])
-        tp2 = float(tp_levels[1])
-
-        if avg and price >= avg * (1 + tp1 / 100) and not pos.get("take_profit_10_sent"):
-            pos["take_profit_10_sent"] = True
-            messages.append(
-                f"🟢 ВРЕМЯ ФИКСАЦИИ {coin}\n"
-                f"Цена сейчас: {fmt_usdt(price)} USDT\n"
-                f"Средняя: {fmt_usdt(avg)} USDT\n"
-                f"Позиция в плюсе: {pnl_pct:+.2f}% / {fmt_money(pnl)}\n"
-                f"Первый TP для {category}: +{tp1:.0f}%\n"
-                f"Можно зафиксировать 25–50% или закрыть: /sell {coin} all"
-            )
-
-        if avg and price >= avg * (1 + tp2 / 100) and not pos.get("take_profit_15_sent"):
-            pos["take_profit_15_sent"] = True
-            messages.append(
-                f"🟢 СИЛЬНЫЙ ПЛЮС ПО {coin}\n"
-                f"Цена сейчас: {fmt_usdt(price)} USDT\n"
-                f"Средняя: {fmt_usdt(avg)} USDT\n"
-                f"Позиция: {pnl_pct:+.2f}% / {fmt_money(pnl)}\n"
-                f"Второй TP для {category}: +{tp2:.0f}%\n"
-                f"Рекомендация системы: частичная фиксация прибыли."
-            )
+        # Пыль/остаток (< $1): фиксировать нечего — не шлём никаких TP/трейлинг
+        # уведомлений по этой позиции. Из учёта НЕ удаляем, просто пропускаем
+        # всю профит-логику ниже. Единственная система фиксации — advisory TP1.
+        if value < MIN_POSITION_VALUE_USDT:
+            continue
 
         # --- Трейлинг стоп: ТОЛЬКО детекция ---
         # C1/C2: здесь НЕ меняем qty/invested_usdt, НЕ ставим постоянных флагов
