@@ -1,7 +1,8 @@
 import asyncio
+import contextlib
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aiogram import Bot
@@ -10,7 +11,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from app.market import analyze_market, make_exchange, fetch_ohlcv_df
 from app.signals import classify_signal, format_compact_signal, format_core_signal
 from app.settings import settings
-from app.storage import get_position, update_portfolio
+from app.storage import get_position, update_portfolio, DATA_DIR
 from app.formatters import fmt_usdt, fmt_money
 from app.error_log import log_error
 from app.spot_journal import log_spot_sell
@@ -30,6 +31,34 @@ PRO_INTERVAL_SECONDS = 5 * 60
 # Проверяем возраст профилей волатильности раз в 6ч; сам пересчёт срабатывает
 # только если профили старше 7 дней (логика внутри maybe_refresh_profiles).
 VOLPROFILE_INTERVAL_SECONDS = 6 * 3600
+
+# ─── Живучесть торгового цикла (супервайзер + watchdog) ────────────────────────
+LOOP_RESTART_DELAY_SECONDS = 15      # пауза перед перезапуском упавшего цикла
+WATCHDOG_CHECK_SECONDS = 60          # как часто watchdog проверяет heartbeat
+HEARTBEAT_STALE_SECONDS = 10 * 60    # тик старше этого => система считается зависшей
+
+# In-process heartbeat торгового цикла. Обновляется на каждой итерации внутреннего
+# цикла; watchdog и /health читают его, чтобы отличить живой цикл от зависшего.
+_last_beat: dict[str, float | str | None] = {"monotonic": None, "wall": None}
+
+
+def _beat() -> None:
+    """Отметить, что внутренний цикл прошёл ещё одну итерацию (жив)."""
+    _last_beat["monotonic"] = time.monotonic()
+    _last_beat["wall"] = datetime.now().isoformat(timespec="seconds")
+
+
+def _beat_age_seconds() -> float | None:
+    """Сколько секунд назад цикл в последний раз бился. None — ещё ни разу."""
+    m = _last_beat["monotonic"]
+    if m is None:
+        return None
+    return time.monotonic() - float(m)
+
+
+class _LoopStuck(Exception):
+    """Watchdog обнаружил зависший цикл и запросил принудительный перезапуск."""
+
 
 TRAILING_TP1_PCT = 9.0      # % роста от средней для активации трейлинга
 TRAILING_TP1_SHARE = 0.40   # доля позиции, которую рекомендуем закрыть на TP1
@@ -412,7 +441,7 @@ async def _process_sell_action(bot: Bot, chat_id: int, action: dict) -> None:
     coin = action["coin"]
 
     if not settings.tp_auto_execute:
-        await bot.send_message(chat_id, _advisory_sell_message(action))
+        await safe_send(bot, chat_id, _advisory_sell_message(action))
         try:
             _apply_advisory_cooldown(coin, action["type"])
         except Exception as exc:
@@ -430,7 +459,7 @@ async def _process_sell_action(bot: Bot, chat_id: int, action: dict) -> None:
             RuntimeError(result.get("error") or "order failed"),
             {"coin": coin, "type": action.get("type"), "qty_sell": action.get("qty_sell"), "result": result},
         )
-        await bot.send_message(chat_id, _failed_sell_message(action, result))
+        await safe_send(bot, chat_id, _failed_sell_message(action, result))
         return
 
     # ok=True — фактические цифры из ответа Bybit
@@ -462,7 +491,7 @@ async def _process_sell_action(bot: Bot, chat_id: int, action: dict) -> None:
     except Exception as exc:
         log_error("monitor.spot_journal", exc, {"coin": coin, "type": action.get("type")})
 
-    await bot.send_message(chat_id, _confirmed_sell_message(action, exec_price, qty_done))
+    await safe_send(bot, chat_id, _confirmed_sell_message(action, exec_price, qty_done))
 
     # Источник истины по qty при реальной торговле — баланс Bybit (H1+H2).
     _reconcile_after_sell(coin)
@@ -496,15 +525,90 @@ def format_rotation_event(result: dict) -> str | None:
     return None
 
 
+async def safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
+    """Отправить сообщение в Telegram, НИКОГДА не бросая исключение наружу.
+
+    Telegram — некритичный путь: если API недоступен (DNS/сеть), сбой пишется в
+    error_log.jsonl на диск, а торговый цикл продолжает работать. Именно голый
+    ``await bot.send_message`` внутри обработчиков ошибок ронял весь цикл.
+    """
+    try:
+        await bot.send_message(chat_id, text, **kwargs)
+        return True
+    except Exception as exc:
+        log_error("monitor.telegram_send", exc, {"text": (text or "")[:160]})
+        return False
+
+
+async def _supervise(
+    run_once,
+    *,
+    restart_delay: float = LOOP_RESTART_DELAY_SECONDS,
+    on_crash=None,
+    max_iterations: int | None = None,
+) -> None:
+    """Перезапускать ``run_once`` вечно: любое Exception логируется на диск и цикл
+    поднимается заново. CancelledError (штатная остановка процесса) пробрасывается.
+
+    ``max_iterations`` ограничивает число прогонов — только для тестов.
+    """
+    n = 0
+    while True:
+        try:
+            await run_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_error("monitor.loop_crash", exc, {"iteration": n})
+            if on_crash is not None:
+                with contextlib.suppress(Exception):
+                    await on_crash(exc)
+        n += 1
+        if max_iterations is not None and n >= max_iterations:
+            return
+        await asyncio.sleep(restart_delay)
+
+
+async def _watch(inner: asyncio.Task, bot: Bot, chat_id: int) -> None:
+    """Watchdog: ждёт завершения inner, параллельно следя за heartbeat.
+
+    Если inner ещё работает, но heartbeat старше HEARTBEAT_STALE_SECONDS — цикл
+    завис (например, залип на сетевом вызове). Тогда пишем на диск, уведомляем и
+    бросаем _LoopStuck, чтобы супервайзер перезапустил цикл.
+    """
+    while True:
+        done, _ = await asyncio.wait({inner}, timeout=WATCHDOG_CHECK_SECONDS)
+        if inner in done:
+            await inner  # проброс результата/исключения inner в супервайзер
+            return
+        age = _beat_age_seconds()
+        if age is not None and age > HEARTBEAT_STALE_SECONDS:
+            log_error(
+                "monitor.watchdog_restart",
+                _LoopStuck(f"loop stuck {age:.0f}s"),
+                {"age_seconds": round(age)},
+            )
+            await safe_send(
+                bot, chat_id,
+                f"⏱ Торговый цикл завис на {age / 60:.1f} мин — принудительный перезапуск."
+            )
+            raise _LoopStuck(f"stuck {age:.0f}s")
+
+
 async def monitor_loop(bot: Bot) -> None:
+    """Публичная точка входа: супервайзер поверх торгового цикла.
+
+    Держит внутренний цикл живым при любых сбоях (ЗАДАЧА 1) и снабжён watchdog'ом
+    (ЗАДАЧА 4). bot.py вызывает именно эту функцию.
+    """
     if not settings.telegram_allowed_user_id:
         print("AUTO_MONITOR: TELEGRAM_ALLOWED_USER_ID не задан, фоновые сигналы отключены.")
         return
 
     chat_id = int(settings.telegram_allowed_user_id)
-    interval_seconds = max(settings.scan_interval_minutes, 1) * 60
 
-    await bot.send_message(
+    await safe_send(
+        bot,
         chat_id,
         f"🟢 Автомониторинг v15 запущен.\n"
         f"Рынок: {settings.scan_interval_minutes} мин.\n"
@@ -512,8 +616,36 @@ async def monitor_loop(bot: Bot) -> None:
         f"/ {settings.bybit_portfolio_monitor_minutes} мин.\n"
         f"Rotation Lab demo: каждые {ROTATION_INTERVAL_SECONDS // 60} мин.\n"
         f"Futures Lab demo: каждые {FUTURES_INTERVAL_SECONDS // 60} мин.\n\n"
-        "Команды: /status /scan /positions /bybit /syncbybit /rotation /futures /circuitstatus"
+        "Команды: /status /scan /positions /bybit /syncbybit /rotation /futures /circuitstatus /health"
     )
+
+    async def run_once() -> None:
+        inner = asyncio.create_task(_monitor_loop_inner(bot, chat_id))
+        try:
+            await _watch(inner, bot, chat_id)
+        except BaseException:
+            # Зависание (_LoopStuck), падение inner или остановка процесса —
+            # в любом случае гасим внутреннюю задачу перед выходом/перезапуском.
+            inner.cancel()
+            with contextlib.suppress(BaseException):
+                await inner
+            raise
+
+    async def on_crash(exc: Exception) -> None:
+        await safe_send(
+            bot, chat_id,
+            f"♻️ Торговый цикл упал: {type(exc).__name__}. "
+            f"Перезапуск через {LOOP_RESTART_DELAY_SECONDS}с (детали в error_log.jsonl)."
+        )
+
+    await _supervise(run_once, on_crash=on_crash)
+
+
+async def _monitor_loop_inner(bot: Bot, chat_id: int) -> None:
+    """Собственно торговый цикл. Каждый bot.send_message — через safe_send, чтобы
+    сбой Telegram не убивал цикл (ЗАДАЧА 2). Каждая итерация бьёт heartbeat."""
+    interval_seconds = max(settings.scan_interval_minutes, 1) * 60
+    bybit_interval = max(settings.bybit_portfolio_monitor_minutes, 1) * 60
 
     last_market_scan = 0.0
     last_bybit_scan = 0.0
@@ -522,9 +654,8 @@ async def monitor_loop(bot: Bot) -> None:
     last_pro_scan = 0.0
     last_volprofile_scan = 0.0
 
-    bybit_interval = max(settings.bybit_portfolio_monitor_minutes, 1) * 60
-
     while True:
+        _beat()
         now = time.monotonic()
 
         # Профиль волатильности монет: автопересчёт раз в 7 дней.
@@ -532,7 +663,7 @@ async def monitor_loop(bot: Bot) -> None:
             try:
                 refreshed = await asyncio.to_thread(maybe_refresh_profiles)
                 if refreshed:
-                    await bot.send_message(chat_id, "📊 Профили волатильности монет пересчитаны (раз в 7 дней).")
+                    await safe_send(bot, chat_id, "📊 Профили волатильности монет пересчитаны (раз в 7 дней).")
                 last_volprofile_scan = now
             except Exception as exc:
                 log_error("monitor.volprofile_refresh", exc, {})
@@ -547,10 +678,11 @@ async def monitor_loop(bot: Bot) -> None:
             try:
                 messages = await asyncio.to_thread(check_bybit_portfolio_changes, True)
                 for text in messages:
-                    await bot.send_message(chat_id, text)
+                    await safe_send(bot, chat_id, text)
                 last_bybit_scan = now
             except Exception as exc:
-                await bot.send_message(chat_id, f"⚠️ Ошибка Bybit-монитора: {exc}")
+                log_error("monitor.bybit_monitor", exc, {})
+                await safe_send(bot, chat_id, f"⚠️ Ошибка Bybit-монитора: {exc}")
                 last_bybit_scan = now
 
         # Rotation Lab demo tick
@@ -562,10 +694,11 @@ async def monitor_loop(bot: Bot) -> None:
                 for ev in result.get("events", [result]):
                     text = format_rotation_event(ev)
                     if text:
-                        await bot.send_message(chat_id, text)
+                        await safe_send(bot, chat_id, text)
                 last_rotation_scan = now
             except Exception as exc:
-                await bot.send_message(chat_id, f"⚠️ Ошибка Rotation Lab: {exc}")
+                log_error("monitor.rotation_tick", exc, {})
+                await safe_send(bot, chat_id, f"⚠️ Ошибка Rotation Lab: {exc}")
                 last_rotation_scan = now
 
         # Futures Lab demo tick
@@ -574,12 +707,13 @@ async def monitor_loop(bot: Bot) -> None:
                 result = await asyncio.to_thread(futures_tick)
                 text = format_futures_event(result.get("event"))
                 if text:
-                    await bot.send_message(chat_id, text)
+                    await safe_send(bot, chat_id, text)
                 for note in result.get("notifications") or []:
-                    await bot.send_message(chat_id, note)
+                    await safe_send(bot, chat_id, note)
                 last_futures_scan = now
             except Exception as exc:
-                await bot.send_message(chat_id, f"⚠️ Ошибка Futures Lab: {exc}")
+                log_error("monitor.futures_tick", exc, {})
+                await safe_send(bot, chat_id, f"⚠️ Ошибка Futures Lab: {exc}")
                 last_futures_scan = now
 
         # PRO Lab demo tick (trend-following competitor to Futures Lab)
@@ -588,12 +722,13 @@ async def monitor_loop(bot: Bot) -> None:
                 result = await asyncio.to_thread(pro_tick)
                 text = format_pro_event(result.get("event"))
                 if text:
-                    await bot.send_message(chat_id, text)
+                    await safe_send(bot, chat_id, text)
                 for note in result.get("notifications") or []:
-                    await bot.send_message(chat_id, note)
+                    await safe_send(bot, chat_id, note)
                 last_pro_scan = now
             except Exception as exc:
-                await bot.send_message(chat_id, f"⚠️ Ошибка PRO Lab: {exc}")
+                log_error("monitor.pro_tick", exc, {})
+                await safe_send(bot, chat_id, f"⚠️ Ошибка PRO Lab: {exc}")
                 last_pro_scan = now
 
         if now - last_market_scan >= interval_seconds:
@@ -604,15 +739,91 @@ async def monitor_loop(bot: Bot) -> None:
                 signal_messages = build_monitor_signals(items, market_context)
                 for text, coin, entry_usdt in signal_messages:
                     kb = signal_keyboard(coin, entry_usdt) if coin not in CORE_COINS else None
-                    await bot.send_message(chat_id, text, reply_markup=kb)
+                    await safe_send(bot, chat_id, text, reply_markup=kb)
                 alert_msgs, pending_execs = build_position_alerts(items)
                 for text in alert_msgs:
-                    await bot.send_message(chat_id, text)
+                    await safe_send(bot, chat_id, text)
                 for action in pending_execs:
                     await _process_sell_action(bot, chat_id, action)
                 last_market_scan = now
             except Exception as exc:
-                await bot.send_message(chat_id, f"⚠️ Ошибка автомониторинга: {exc}")
+                log_error("monitor.market_scan", exc, {})
+                await safe_send(bot, chat_id, f"⚠️ Ошибка автомониторинга: {exc}")
                 last_market_scan = now
 
         await asyncio.sleep(30)
+
+
+# ─── Heartbeat / health (ЗАДАЧА 4) ─────────────────────────────────────────────
+
+def _tick_age_seconds(last_tick_iso: str | None, now: datetime | None = None) -> float | None:
+    """Возраст ISO-таймстемпа тика в секундах. None если пусто/непарсибельно."""
+    if not last_tick_iso:
+        return None
+    now = now or datetime.now(timezone.utc)
+    try:
+        d = datetime.fromisoformat(str(last_tick_iso))
+    except (ValueError, TypeError):
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (now - d).total_seconds()
+
+
+def build_system_health(
+    state: dict | None = None,
+    *,
+    threshold_seconds: float = HEARTBEAT_STALE_SECONDS,
+    now: datetime | None = None,
+) -> dict:
+    """Возраст last_tick каждой системы + флаг жив/завис.
+
+    Если state не передан — читаем portfolio_state.json с диска. Loop-heartbeat
+    берётся из in-process _last_beat (обновляется каждые ~30с внутренним циклом).
+    """
+    now = now or datetime.now(timezone.utc)
+    if state is None:
+        try:
+            state = json.loads((DATA_DIR / "portfolio_state.json").read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+
+    out: dict[str, dict] = {}
+    for name, key in (("futures", "futures_lab"), ("rotation", "rotation_lab"), ("pro", "pro_lab")):
+        last_tick = (state.get(key) or {}).get("last_tick")
+        age = _tick_age_seconds(last_tick, now)
+        out[name] = {
+            "last_tick": last_tick,
+            "age_seconds": age,
+            "alive": age is not None and age <= threshold_seconds,
+        }
+
+    loop_age = _beat_age_seconds()
+    out["loop"] = {
+        "last_tick": _last_beat["wall"],
+        "age_seconds": loop_age,
+        "alive": loop_age is not None and loop_age <= threshold_seconds,
+    }
+    return out
+
+
+def format_health(threshold_seconds: float = HEARTBEAT_STALE_SECONDS) -> str:
+    health = build_system_health(threshold_seconds=threshold_seconds)
+    labels = {"loop": "Торговый цикл", "futures": "Futures", "rotation": "Rotation", "pro": "PRO"}
+    lines = ["🩺 ЖИВУЧЕСТЬ СИСТЕМ", ""]
+    all_alive = True
+    for key in ("loop", "futures", "rotation", "pro"):
+        h = health[key]
+        age = h["age_seconds"]
+        if age is None:
+            mark, age_txt = "❓", "нет данных"
+        elif h["alive"]:
+            mark, age_txt = "🟢", f"{age / 60:.1f} мин назад"
+        else:
+            mark, age_txt = "🔴", f"ЗАВИС ({age / 60:.1f} мин назад)"
+            all_alive = False
+        lines.append(f"{mark} {labels[key]}: {age_txt}")
+    lines += ["", ("✅ Все системы живы." if all_alive else f"⚠️ Порог зависания: {threshold_seconds / 60:.0f} мин.")]
+    return "\n".join(lines)

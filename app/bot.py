@@ -14,7 +14,7 @@ from app.news_risk import short_news_text
 from app.market_intelligence import build_market_context
 from app.signals import format_signal_report, classify_signal, format_compact_signal, get_market_regime, get_entry_levels_for_coin
 from app.portfolio import format_portfolio_plan
-from app.monitor import monitor_loop, STATE_PATH
+from app.monitor import monitor_loop, STATE_PATH, format_health
 from app.storage import record_buy, record_sell, get_open_positions, export_journal_csv, get_position, migrate_positions_to_personal_levels
 from app.formatters import format_positions_report, format_journal, format_stats_report, format_risk_report, format_buy_risk_warning, fmt_usdt, fmt_money
 from app.ui import split_text
@@ -1466,6 +1466,18 @@ async def cmd_circuitstatus(message: Message):
         await message.answer(f"Ошибка circuit status: {exc}")
 
 
+async def cmd_health(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        text = await asyncio.to_thread(format_health)
+        for chunk in split_text(text):
+            await message.answer(chunk)
+    except Exception as exc:
+        await message.answer(f"Ошибка health: {exc}")
+
+
 async def cmd_rotation(message: Message):
     if not is_allowed(message):
         await message.answer("Нет доступа.")
@@ -1797,6 +1809,7 @@ async def main():
     dp.message.register(cmd_futuresreport, Command("futuresreport"))
     dp.message.register(cmd_exportfutures, Command("exportfutures"))
     dp.message.register(cmd_circuitstatus, Command("circuitstatus"))
+    dp.message.register(cmd_health, Command("health"))
 
     # Rotation Lab
     dp.message.register(cmd_rotation, Command("rotation"))
