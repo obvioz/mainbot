@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,35 @@ REGIME_EMA_SLOW = 200               # 4h slow EMA (trend backbone)
 REGIME_CANDLE_LIMIT = 320           # enough history for EMA200 + slope lookback
 REGIME_MACRO_SLOPE_LOOKBACK = 3     # 4h candles back to measure EMA50 slope
 REGIME_REFRESH_HOURS = 1            # recompute the macro regime at most once per hour
+
+# ─── "Thinking" quality layer (three independent filters on top of everything) ──
+# Each filter sits ABOVE the direction filter (BTC+coin regime) and circuit
+# breakers — it never replaces them. Each is toggled independently so its
+# contribution can be measured in isolation, and every block is logged with
+# ``which_filter`` (mtf / confluence / structure) plus details.
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "y", "on", "да"}
+
+
+MTF_FILTER_ON = _env_flag("FUTURES_MTF_FILTER", True)              # Layer 1: multi-timeframe alignment
+CONFLUENCE_FILTER_ON = _env_flag("FUTURES_CONFLUENCE_FILTER", True)  # Layer 2: setup confluence
+STRUCTURE_FILTER_ON = _env_flag("FUTURES_STRUCTURE_FILTER", True)  # Layer 3: market structure (S/R)
+
+MTF_TIMEFRAMES = ("1d", "4h", "1h")   # higher→lower; 1d/4h gate, 1h times the entry
+MIN_CONFLUENCE = 3                    # need at least this many independent confirmations
+CONFLUENCE_MIN_MAGNITUDE = 10.0       # score_components["magnitude"] ≥ this = quality pullback/breakout
+CONFLUENCE_ROOM_ATR = 0.5             # entry-TF room to opposite extreme (in ATR) to count as clear
+STRUCTURE_MIN_ATR = 1.0              # min distance to the opposite 4h swing level, in ATR units
+STRUCTURE_SWING_TF = "4h"
+STRUCTURE_SWING_LOOKBACK = 20        # 4h candles scanned for swing highs/lows
+STRUCTURE_SWING_WING = 2            # bars on each side required to qualify a local extreme
+THINKING_TREND_CANDLES = 320         # history per TF for EMA50/EMA200 trend classification
+THINKING_VOLUME_LOOKBACK = 20        # 1h candles for the average-volume baseline
 
 
 def now_iso() -> str:
@@ -225,6 +255,254 @@ def _get_macro_regimes(
     return cache
 
 
+# ─── Thinking layer — pure decision helpers (no I/O; unit-tested directly) ──────
+
+def _trend_from_closes(closes: list[float]) -> str:
+    """UP/DOWN/FLAT for a timeframe from its closes via EMA50/EMA200 (same rule as 4h)."""
+    if len(closes) < REGIME_EMA_SLOW + REGIME_MACRO_SLOPE_LOOKBACK + 1:
+        return "FLAT"
+    ema_fast = _compute_ema(closes, REGIME_EMA_FAST)
+    ema_slow = _compute_ema(closes, REGIME_EMA_SLOW)
+    price = closes[-1]
+    ema50 = ema_fast[-1]
+    ema50_prev = ema_fast[-1 - REGIME_MACRO_SLOPE_LOOKBACK]
+    ema200 = ema_slow[-1]
+    return _classify_macro_regime(price, ema50, ema50_prev, ema200)
+
+
+def _mtf_filter_block(side: str, trend_1d: str, trend_4h: str) -> str | None:
+    """LAYER 1. Higher timeframes (1d, 4h) must not be against the trade side.
+
+    LONG needs 1d and 4h both not DOWN; SHORT needs both not UP. A higher-TF that
+    opposes the side (or a 1d-up/4h-down style conflict) → block "mtf_conflict".
+    The 1h timeframe is where the entry is actually timed, so it is journaled but
+    does not gate here.
+    """
+    against = "DOWN" if side == "long" else "UP"
+    if trend_1d == against or trend_4h == against:
+        return "mtf_conflict"
+    return None
+
+
+def _confluence_factors(
+    side: str,
+    *,
+    magnitude: float,
+    vol_ratio: float,
+    current: float,
+    atr: float,
+    high20: float | None,
+    low20: float | None,
+    trend_4h: str,
+    atr_extreme: bool,
+) -> dict[str, bool]:
+    """LAYER 2 inputs. Five INDEPENDENT confirmations, each a boolean."""
+    want = "UP" if side == "long" else "DOWN"
+    factors: dict[str, bool] = {}
+    # 1) higher-TF trend agrees with the side
+    factors["htf_trend"] = trend_4h == want
+    # 2) the pullback/breakout on the entry TF is deep/clean enough
+    factors["setup_quality"] = float(magnitude or 0) >= CONFLUENCE_MIN_MAGNITUDE
+    # 3) volume confirms the move
+    factors["volume"] = float(vol_ratio or 0) >= 1.0
+    # 4) not entering right into the opposite recent extreme (entry-TF 20-bar range)
+    if atr and atr > 0 and high20 is not None and low20 is not None:
+        gap = (high20 - current) / atr if side == "long" else (current - low20) / atr
+        factors["room_to_extreme"] = not (0 <= gap < CONFLUENCE_ROOM_ATR)
+    else:
+        factors["room_to_extreme"] = False
+    # 5) volatility in a normal regime (not an EXPANDING/chaotic ATR)
+    factors["vol_normal"] = not bool(atr_extreme)
+    return factors
+
+
+def _confluence_block(factors: dict[str, bool]) -> tuple[str | None, int, list[str]]:
+    """LAYER 2. Fewer than MIN_CONFLUENCE confirmations → block "low_confluence"."""
+    active = [k for k, v in factors.items() if v]
+    score = len(active)
+    if score < MIN_CONFLUENCE:
+        return "low_confluence", score, active
+    return None, score, active
+
+
+def _swing_points(
+    highs: list[float], lows: list[float], wing: int, lookback: int
+) -> tuple[list[float], list[float]]:
+    """Local swing highs/lows over the last ``lookback`` bars.
+
+    A bar is a swing high if its high is the max within ``wing`` bars on each side
+    (mirror for swing low). Returns the extreme prices (not indices).
+    """
+    n = len(highs)
+    if n == 0:
+        return [], []
+    start = max(wing, n - lookback)
+    swing_highs: list[float] = []
+    swing_lows: list[float] = []
+    for i in range(start, n - wing):
+        window_h = highs[i - wing:i + wing + 1]
+        window_l = lows[i - wing:i + wing + 1]
+        if highs[i] >= max(window_h):
+            swing_highs.append(highs[i])
+        if lows[i] <= min(window_l):
+            swing_lows.append(lows[i])
+    return swing_highs, swing_lows
+
+
+def _nearest_levels(
+    current: float, swing_highs: list[float], swing_lows: list[float]
+) -> tuple[float | None, float | None]:
+    """Nearest swing high above (resistance) and swing low below (support)."""
+    above = [h for h in swing_highs if h > current]
+    below = [l for l in swing_lows if l < current]
+    nearest_resistance = min(above) if above else None
+    nearest_support = max(below) if below else None
+    return nearest_resistance, nearest_support
+
+
+def _structure_block(
+    side: str,
+    current: float,
+    atr_4h: float,
+    nearest_resistance: float | None,
+    nearest_support: float | None,
+) -> tuple[str | None, float | None]:
+    """LAYER 3. Block a LONG entering just under resistance (or SHORT just over
+    support) — < STRUCTURE_MIN_ATR to the opposite level is a poor risk/reward.
+
+    Returns (block_reason|None, distance_to_level_atr).
+    """
+    if not atr_4h or atr_4h <= 0:
+        return None, None
+    if side == "long":
+        if nearest_resistance is None:
+            return None, None
+        dist = round((nearest_resistance - current) / atr_4h, 3)
+    else:
+        if nearest_support is None:
+            return None, None
+        dist = round((current - nearest_support) / atr_4h, 3)
+    if 0 <= dist < STRUCTURE_MIN_ATR:
+        return "poor_structure_rr", dist
+    return None, dist
+
+
+def _volume_ratio(volumes: list[float], lookback: int = THINKING_VOLUME_LOOKBACK) -> float:
+    """Latest volume vs the average of the preceding ``lookback`` bars."""
+    if len(volumes) < lookback + 1:
+        return 0.0
+    baseline = volumes[-lookback - 1:-1]
+    avg = sum(baseline) / len(baseline) if baseline else 0.0
+    if avg <= 0:
+        return 0.0
+    return volumes[-1] / avg
+
+
+# ─── Thinking layer — I/O orchestration ────────────────────────────────────────
+
+def _thinking_analysis(exchange, symbol: str) -> dict[str, Any]:
+    """Fetch the multi-timeframe context the three filters need (1d/4h/1h)."""
+    d_candles = exchange.fetch_ohlcv(symbol, timeframe="1d", limit=THINKING_TREND_CANDLES)
+    trend_1d = _trend_from_closes([float(c[4]) for c in (d_candles or [])])
+
+    h1_candles = exchange.fetch_ohlcv(symbol, timeframe="1h", limit=max(THINKING_TREND_CANDLES, 60))
+    trend_1h = _trend_from_closes([float(c[4]) for c in (h1_candles or [])])
+    vol_ratio = _volume_ratio([float(c[5]) for c in (h1_candles or [])])
+
+    h4_candles = exchange.fetch_ohlcv(symbol, timeframe=STRUCTURE_SWING_TF, limit=STRUCTURE_SWING_LOOKBACK * 3)
+    highs = [float(c[2]) for c in (h4_candles or [])]
+    lows = [float(c[3]) for c in (h4_candles or [])]
+    swing_highs, swing_lows = _swing_points(highs, lows, STRUCTURE_SWING_WING, STRUCTURE_SWING_LOOKBACK)
+    atr_4h_list = _compute_atr(h4_candles, ATR_PERIOD) if h4_candles else []
+    atr_4h = next((a for a in reversed(atr_4h_list) if not math.isnan(a) and a > 0), 0.0)
+
+    return {
+        "trend_1d": trend_1d,
+        "trend_1h": trend_1h,
+        "vol_ratio": round(vol_ratio, 3),
+        "atr_4h": atr_4h,
+        "swing_highs": swing_highs,
+        "swing_lows": swing_lows,
+    }
+
+
+def _apply_thinking_filters(
+    exchange, sig: dict[str, Any], trend_4h: str, cache: dict[str, dict]
+) -> tuple[str | None, str | None, dict[str, Any], dict[str, Any]]:
+    """Run the three quality filters in order (MTF → confluence → structure).
+
+    Returns (block_reason|None, which_filter|None, block_details, assessment).
+    ``assessment`` always carries every layer's measurement (even for disabled
+    layers) so the entry journal can correlate each layer with the outcome.
+    """
+    if not (MTF_FILTER_ON or CONFLUENCE_FILTER_ON or STRUCTURE_FILTER_ON):
+        return None, None, {}, {}  # all off → behave exactly as before
+
+    symbol = sig["symbol"]
+    side = sig["side"]
+    try:
+        ta = cache.get(symbol) or _thinking_analysis(exchange, symbol)
+        cache[symbol] = ta
+    except Exception as exc:
+        # Fail-open: a data hiccup must not block every entry.
+        return None, None, {"error": str(exc)}, {"error": str(exc)}
+
+    trend_1d, trend_1h = ta["trend_1d"], ta["trend_1h"]
+    assessment: dict[str, Any] = {
+        "trend_1d": trend_1d,
+        "trend_4h": trend_4h,
+        "trend_1h": trend_1h,
+    }
+
+    # Layer 1 — multi-timeframe alignment
+    if MTF_FILTER_ON:
+        r = _mtf_filter_block(side, trend_1d, trend_4h)
+        if r:
+            return r, "mtf", {"trend_1d": trend_1d, "trend_4h": trend_4h, "trend_1h": trend_1h}, assessment
+
+    # Layer 2 — setup confluence (always measured; only blocks when enabled)
+    factors = _confluence_factors(
+        side,
+        magnitude=(sig.get("score_components") or {}).get("magnitude", 0.0),
+        vol_ratio=ta["vol_ratio"],
+        current=float(sig["current"]),
+        atr=float(sig.get("atr") or 0),
+        high20=sig.get("high20"),
+        low20=sig.get("low20"),
+        trend_4h=trend_4h,
+        atr_extreme=bool(sig.get("atr_extreme", False)),
+    )
+    conf_reason, conf_score, active = _confluence_block(factors)
+    assessment["confluence_score"] = conf_score
+    assessment["confluence_factors"] = active
+    if CONFLUENCE_FILTER_ON and conf_reason:
+        return conf_reason, "confluence", {"confluence_score": conf_score, "factors": active}, assessment
+
+    # Layer 3 — market structure (support/resistance risk-reward)
+    nearest_resistance, nearest_support = _nearest_levels(
+        float(sig["current"]), ta["swing_highs"], ta["swing_lows"]
+    )
+    struct_reason, dist_atr = _structure_block(
+        side, float(sig["current"]), ta["atr_4h"], nearest_resistance, nearest_support
+    )
+    assessment["nearest_resistance"] = nearest_resistance
+    assessment["nearest_support"] = nearest_support
+    assessment["distance_to_level_atr"] = dist_atr
+    if STRUCTURE_FILTER_ON and struct_reason:
+        return (
+            struct_reason,
+            "structure",
+            {
+                "nearest_resistance": nearest_resistance,
+                "nearest_support": nearest_support,
+                "distance_to_level_atr": dist_atr,
+            },
+            assessment,
+        )
+
+    return None, None, {}, assessment
+
+
 def _short_pump_pct(candles: list, current_price: float) -> float:
     """Max single-1h-candle upside move (open→high / open→current), used for pump guard."""
     moves: list[float] = []
@@ -262,17 +540,31 @@ def _roll_day(lab: dict[str, Any]) -> dict[str, Any]:
 
 
 def _log_blocked_entry(
-    lab: dict[str, Any], symbol: str, side: str, strategy: str, regime: str, reason: str
+    lab: dict[str, Any],
+    symbol: str,
+    side: str,
+    strategy: str,
+    regime: str,
+    reason: str,
+    which_filter: str | None = None,
+    details: dict[str, Any] | None = None,
 ) -> None:
     lab.setdefault("blocked_entries", [])
-    lab["blocked_entries"].append({
+    row: dict[str, Any] = {
         "time": now_iso(),
         "symbol": symbol,
         "side": side,
         "strategy": strategy,
         "regime": regime,
         "reason": reason,
-    })
+    }
+    # which_filter distinguishes the thinking layer (mtf/confluence/structure) from
+    # legacy blocks so /thinking can attribute how much each layer filters out.
+    if which_filter:
+        row["which_filter"] = which_filter
+    if details:
+        row["details"] = details
+    lab["blocked_entries"].append(row)
     lab["blocked_entries"] = lab["blocked_entries"][-MAX_JOURNAL_ROWS:]
 
 
@@ -806,6 +1098,12 @@ def _scan_for_signals(exchange) -> list[dict[str, Any]]:
                     "regime": data.get("regime", "range"),
                     "atr_avg": data.get("atr_avg"),
                     "atr_extreme": data.get("atr_extreme", False),
+                    # Entry-TF context carried for the thinking layer (confluence/structure).
+                    "high20": data.get("high20"),
+                    "low20": data.get("low20"),
+                    "ema9": data.get("ema9"),
+                    "ema30": data.get("ema30"),
+                    "ema50": data.get("ema50"),
                     **result,
                 })
         except Exception:
@@ -868,6 +1166,9 @@ def _open_trade(
         "actual_risk_pct": round(actual_risk_pct, 4),
         "was_trimmed": bool(was_trimmed),
         "portfolio_risk_before": round(float(portfolio_risk_before), 4),
+        # Thinking-layer assessment (trends per TF, confluence, structure levels) so
+        # each layer can be correlated against the trade outcome offline.
+        "thinking": dict(signal.get("thinking") or {}),
     }
 
     trade: dict[str, Any] = {
@@ -984,6 +1285,7 @@ def _close_trade(
         "actual_risk_pct": trade.get("actual_risk_pct"),
         "was_trimmed": trade.get("was_trimmed"),
         "portfolio_risk_before": trade.get("portfolio_risk_before"),
+        "thinking": trade.get("thinking"),
         "exit_price": exit_price,
         "exit_reason": reason,
         "pnl_pct": round(pnl_pct, 4),
@@ -1226,6 +1528,7 @@ def futures_tick() -> dict[str, Any]:
     signals = _scan_for_signals(exchange)
     chosen = None
     blocked: list[dict[str, Any]] = []
+    thinking_cache: dict[str, dict] = {}  # per-symbol MTF/structure data, one fetch per tick
     for sig in signals:
         coin_regime = coin_regimes.get(sig["symbol"], "FLAT")
         # NEW: strict trend-direction gate, applied on top of the existing breakers.
@@ -1244,9 +1547,25 @@ def futures_tick() -> dict[str, Any]:
             )
             blocked.append({"symbol": sig["symbol"], "side": sig["side"], "reason": sblock})
             continue
-        # Tag the chosen signal with the macro regimes for journaling.
+        # Thinking layer: three quality filters ON TOP of direction+breakers.
+        tblock, which, tdetails, tassess = _apply_thinking_filters(
+            exchange, sig, coin_regime, thinking_cache
+        )
+        if tblock:
+            _log_blocked_entry(
+                lab, sig["symbol"], sig["side"], sig["strategy"],
+                f"btc={btc_regime}/coin={coin_regime}", tblock,
+                which_filter=which, details=tdetails,
+            )
+            blocked.append({
+                "symbol": sig["symbol"], "side": sig["side"],
+                "reason": tblock, "which_filter": which,
+            })
+            continue
+        # Tag the chosen signal with the macro regimes + thinking assessment for journaling.
         sig["btc_regime"] = btc_regime
         sig["coin_regime"] = coin_regime
+        sig["thinking"] = tassess
         chosen = sig
         break
 
@@ -1525,6 +1844,67 @@ def circuit_status() -> str:
                 f"  {b.get('time', '')[:19]} {b.get('symbol')} "
                 f"{b.get('side')} [{b.get('regime')}] → {b.get('reason')}"
             )
+
+    return "\n".join(lines)
+
+
+def _blocked_within_days(blocked: list[dict], days: int) -> list[dict]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out: list[dict] = []
+    for b in blocked:
+        t = _parse_iso(b.get("time"))
+        if t is None or t >= cutoff:
+            out.append(b)
+    return out
+
+
+def thinking_status(days: int = 7) -> str:
+    """Per-filter attribution: how many entries each thinking layer blocked and why."""
+    lab = load_futures_state()
+    blocked = _blocked_within_days(lab.get("blocked_entries") or [], days)
+
+    layers = (
+        ("mtf", "Слой 1 — MTF (мультитаймфрейм)", MTF_FILTER_ON),
+        ("confluence", "Слой 2 — Конфлюэнция", CONFLUENCE_FILTER_ON),
+        ("structure", "Слой 3 — Структура (S/R)", STRUCTURE_FILTER_ON),
+    )
+
+    thinking_blocks = [b for b in blocked if b.get("which_filter") in {"mtf", "confluence", "structure"}]
+
+    lines = [
+        "🧠 THINKING — фильтры качества входа",
+        f"(период: {days}д | всего блокировок слоями: {len(thinking_blocks)})",
+        "",
+    ]
+
+    for key, label, flag_on in layers:
+        rows = [b for b in thinking_blocks if b.get("which_filter") == key]
+        reasons: dict[str, int] = {}
+        for b in rows:
+            reasons[b.get("reason", "?")] = reasons.get(b.get("reason", "?"), 0) + 1
+        state = "🟢 ON" if flag_on else "⚪️ OFF"
+        lines.append(f"{label}: {state} — заблокировал {len(rows)}")
+        for reason, cnt in sorted(reasons.items(), key=lambda kv: kv[1], reverse=True):
+            lines.append(f"    • {reason}: {cnt}")
+
+    # A couple of concrete recent examples for context.
+    if thinking_blocks:
+        lines += ["", "Последние блокировки:"]
+        for b in thinking_blocks[-5:]:
+            det = b.get("details") or {}
+            extra = ""
+            if b.get("which_filter") == "mtf":
+                extra = f" 1d={det.get('trend_1d')}/4h={det.get('trend_4h')}/1h={det.get('trend_1h')}"
+            elif b.get("which_filter") == "confluence":
+                extra = f" score={det.get('confluence_score')} {det.get('factors')}"
+            elif b.get("which_filter") == "structure":
+                extra = f" dist={det.get('distance_to_level_atr')}ATR"
+            lines.append(
+                f"  {str(b.get('time', ''))[:19]} {b.get('symbol')} {b.get('side')} "
+                f"→ [{b.get('which_filter')}] {b.get('reason')}{extra}"
+            )
+    else:
+        lines += ["", "Слои пока ничего не отсекли за период."]
 
     return "\n".join(lines)
 

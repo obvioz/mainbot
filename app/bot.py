@@ -62,6 +62,7 @@ from app.futures_lab import (
     futures_reset,
     futures_set_enabled,
     circuit_status,
+    thinking_status,
     load_futures_state,
 )
 from app.pro_lab import (
@@ -1466,6 +1467,18 @@ async def cmd_circuitstatus(message: Message):
         await message.answer(f"Ошибка circuit status: {exc}")
 
 
+async def cmd_thinking(message: Message):
+    if not is_allowed(message):
+        await message.answer("Нет доступа.")
+        return
+    try:
+        text = await asyncio.to_thread(thinking_status)
+        for chunk in split_text(text):
+            await message.answer(chunk)
+    except Exception as exc:
+        await message.answer(f"Ошибка thinking: {exc}")
+
+
 async def cmd_health(message: Message):
     if not is_allowed(message):
         await message.answer("Нет доступа.")
@@ -1810,6 +1823,7 @@ async def main():
     dp.message.register(cmd_exportfutures, Command("exportfutures"))
     dp.message.register(cmd_circuitstatus, Command("circuitstatus"))
     dp.message.register(cmd_health, Command("health"))
+    dp.message.register(cmd_thinking, Command("thinking"))
 
     # Rotation Lab
     dp.message.register(cmd_rotation, Command("rotation"))
