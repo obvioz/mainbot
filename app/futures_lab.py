@@ -89,10 +89,19 @@ CONFLUENCE_FILTER_ON = _env_flag("FUTURES_CONFLUENCE_FILTER", True)  # Layer 2: 
 STRUCTURE_FILTER_ON = _env_flag("FUTURES_STRUCTURE_FILTER", True)  # Layer 3: market structure (S/R)
 
 MTF_TIMEFRAMES = ("1d", "4h", "1h")   # higher→lower; 1d/4h gate, 1h times the entry
-MIN_CONFLUENCE = 3                    # need at least this many independent confirmations
+
+# ─ Confluence (Layer 2): only genuinely INDEPENDENT confirmations ─
+# htf_trend was removed — it duplicated the direction filter (already gated). The
+# five factors below are each independent of that gate and of each other.
+MIN_CONFLUENCE = 3                    # need ≥ this many independent confirmations (of 5)
 CONFLUENCE_MIN_MAGNITUDE = 10.0       # score_components["magnitude"] ≥ this = quality pullback/breakout
-CONFLUENCE_ROOM_ATR = 0.5             # entry-TF room to opposite extreme (in ATR) to count as clear
-STRUCTURE_MIN_ATR = 1.0              # min distance to the opposite 4h swing level, in ATR units
+CONFLUENCE_MIN_RR = 2.0               # reward:risk to the nearest profit-side level ≥ this
+FRESHNESS_MAX_ATR = 3.0              # entry ≤ this many ATR from EMA30 = not an overripe move
+
+# ─ Structure (Layer 3): breakout re-oriented onto the BROKEN level / range ─
+STRUCTURE_MIN_ATR = 1.0              # pullback/mean-reversion: min room to the profit-side level
+STRUCTURE_BREAKOUT_ROOM_ATR = 1.5    # breakout: min room to the next level ahead (else capped)
+STRUCTURE_RANGE_ATR_MULT = 4.0       # breakout inside a range narrower than this (ATR) = false-prone
 STRUCTURE_SWING_TF = "4h"
 STRUCTURE_SWING_LOOKBACK = 20        # 4h candles scanned for swing highs/lows
 STRUCTURE_SWING_WING = 2            # bars on each side required to qualify a local extreme
@@ -284,36 +293,64 @@ def _mtf_filter_block(side: str, trend_1d: str, trend_4h: str) -> str | None:
     return None
 
 
+def _rr_to_nearest_level(
+    side: str,
+    current: float,
+    stop_price: float,
+    nearest_resistance: float | None,
+    nearest_support: float | None,
+) -> float:
+    """Reward:risk to the nearest level in the PROFIT direction.
+
+    reward = distance to the nearest profit-side swing (resistance for a long,
+    support for a short); risk = distance to the protective stop. When there is no
+    level ahead (open space to run) the R/R is treated as ample (meets threshold).
+    """
+    risk = abs(current - stop_price)
+    if risk <= 0:
+        return 0.0
+    level = nearest_resistance if side == "long" else nearest_support
+    if level is None:
+        return CONFLUENCE_MIN_RR  # open space in the profit direction — not a cap
+    reward = (level - current) if side == "long" else (current - level)
+    if reward <= 0:
+        return 0.0
+    return reward / risk
+
+
+def _is_fresh_setup(current: float, ema30: float, atr: float) -> bool:
+    """Setup is 'fresh' (not overripe) when price is within FRESHNESS_MAX_ATR of EMA30."""
+    if not atr or atr <= 0:
+        return True
+    return abs(current - ema30) / atr <= FRESHNESS_MAX_ATR
+
+
 def _confluence_factors(
     side: str,
     *,
     magnitude: float,
     vol_ratio: float,
-    current: float,
-    atr: float,
-    high20: float | None,
-    low20: float | None,
-    trend_4h: str,
     atr_extreme: bool,
+    rr_to_level: float,
+    is_fresh: bool,
 ) -> dict[str, bool]:
-    """LAYER 2 inputs. Five INDEPENDENT confirmations, each a boolean."""
-    want = "UP" if side == "long" else "DOWN"
-    factors: dict[str, bool] = {}
-    # 1) higher-TF trend agrees with the side
-    factors["htf_trend"] = trend_4h == want
-    # 2) the pullback/breakout on the entry TF is deep/clean enough
-    factors["setup_quality"] = float(magnitude or 0) >= CONFLUENCE_MIN_MAGNITUDE
-    # 3) volume confirms the move
-    factors["volume"] = float(vol_ratio or 0) >= 1.0
-    # 4) not entering right into the opposite recent extreme (entry-TF 20-bar range)
-    if atr and atr > 0 and high20 is not None and low20 is not None:
-        gap = (high20 - current) / atr if side == "long" else (current - low20) / atr
-        factors["room_to_extreme"] = not (0 <= gap < CONFLUENCE_ROOM_ATR)
-    else:
-        factors["room_to_extreme"] = False
-    # 5) volatility in a normal regime (not an EXPANDING/chaotic ATR)
-    factors["vol_normal"] = not bool(atr_extreme)
-    return factors
+    """LAYER 2 inputs. Five genuinely INDEPENDENT confirmations, each a boolean.
+
+    htf_trend was intentionally removed: it merely restated the direction filter
+    that already gated this entry, inflating the count with a guaranteed 'yes'.
+    """
+    return {
+        # 1) quality of the pullback/breakout on the entry TF
+        "setup_quality": float(magnitude or 0) >= CONFLUENCE_MIN_MAGNITUDE,
+        # 2) volume confirms the move
+        "volume": float(vol_ratio or 0) >= 1.0,
+        # 3) volatility in a normal regime (not an EXPANDING/chaotic ATR)
+        "vol_normal": not bool(atr_extreme),
+        # 4) real reward:risk to the nearest level ahead (≥ 2:1)
+        "rr_to_level": float(rr_to_level or 0) >= CONFLUENCE_MIN_RR,
+        # 5) setup freshness — not entering an already overextended move
+        "freshness": bool(is_fresh),
+    }
 
 
 def _confluence_block(factors: dict[str, bool]) -> tuple[str | None, int, list[str]]:
@@ -360,29 +397,55 @@ def _nearest_levels(
     return nearest_resistance, nearest_support
 
 
+def _range_atr(swing_highs: list[float], swing_lows: list[float], atr_4h: float) -> float | None:
+    """Width of the confirmed 4h swing range in ATR units (None if undefined).
+
+    Uses confirmed pivots (which exclude the freshest bars), so a fresh breakout
+    bar does not inflate the measured consolidation width.
+    """
+    if not swing_highs or not swing_lows or not atr_4h or atr_4h <= 0:
+        return None
+    return round((max(swing_highs) - min(swing_lows)) / atr_4h, 3)
+
+
 def _structure_block(
     side: str,
+    strategy: str,
     current: float,
     atr_4h: float,
-    nearest_resistance: float | None,
-    nearest_support: float | None,
+    profit_level: float | None,
+    range_atr: float | None,
 ) -> tuple[str | None, float | None]:
-    """LAYER 3. Block a LONG entering just under resistance (or SHORT just over
-    support) — < STRUCTURE_MIN_ATR to the opposite level is a poor risk/reward.
+    """LAYER 3. Market-structure risk/reward, re-oriented per strategy.
 
-    Returns (block_reason|None, distance_to_level_atr).
+    ``profit_level`` = nearest 4h swing in the PROFIT direction (resistance above
+    for a long, support below for a short).
+
+    breakout: a breakout inside a range narrower than STRUCTURE_RANGE_ATR_MULT ATR
+    is statistically a false break → ``range_bound_breakout``. Otherwise, if the
+    next level ahead sits < STRUCTURE_BREAKOUT_ROOM_ATR away, the move is capped →
+    ``poor_structure_rr``.
+
+    trend_pullback / mean_reversion: keep the original profit-side R/R check
+    (< STRUCTURE_MIN_ATR to the level ahead = poor R/R).
+
+    Returns (block_reason|None, distance_to_level_atr|None).
     """
     if not atr_4h or atr_4h <= 0:
         return None, None
-    if side == "long":
-        if nearest_resistance is None:
-            return None, None
-        dist = round((nearest_resistance - current) / atr_4h, 3)
+
+    if strategy == "breakout":
+        # Tight range → breakouts here are statistically false.
+        if range_atr is not None and range_atr < STRUCTURE_RANGE_ATR_MULT:
+            return "range_bound_breakout", None
+        min_room = STRUCTURE_BREAKOUT_ROOM_ATR
     else:
-        if nearest_support is None:
-            return None, None
-        dist = round((current - nearest_support) / atr_4h, 3)
-    if 0 <= dist < STRUCTURE_MIN_ATR:
+        min_room = STRUCTURE_MIN_ATR
+
+    if profit_level is None:
+        return None, None  # open space in the profit direction — good R/R
+    dist = round(abs(profit_level - current) / atr_4h, 3)
+    if 0 <= dist < min_room:
         return "poor_structure_rr", dist
     return None, dist
 
@@ -460,34 +523,43 @@ def _apply_thinking_filters(
         if r:
             return r, "mtf", {"trend_1d": trend_1d, "trend_4h": trend_4h, "trend_1h": trend_1h}, assessment
 
-    # Layer 2 — setup confluence (always measured; only blocks when enabled)
+    # Shared market-structure context (used by both confluence R/R and structure).
+    current = float(sig["current"])
+    nearest_resistance, nearest_support = _nearest_levels(
+        current, ta["swing_highs"], ta["swing_lows"]
+    )
+    profit_level = nearest_resistance if side == "long" else nearest_support
+    range_atr = _range_atr(ta["swing_highs"], ta["swing_lows"], ta["atr_4h"])
+
+    # Layer 2 — setup confluence (always measured; only blocks when enabled).
+    rr = _rr_to_nearest_level(
+        side, current, float(sig.get("stop_price") or 0),
+        nearest_resistance, nearest_support,
+    )
+    is_fresh = _is_fresh_setup(current, float(sig.get("ema30") or 0), float(sig.get("atr") or 0))
     factors = _confluence_factors(
         side,
         magnitude=(sig.get("score_components") or {}).get("magnitude", 0.0),
         vol_ratio=ta["vol_ratio"],
-        current=float(sig["current"]),
-        atr=float(sig.get("atr") or 0),
-        high20=sig.get("high20"),
-        low20=sig.get("low20"),
-        trend_4h=trend_4h,
         atr_extreme=bool(sig.get("atr_extreme", False)),
+        rr_to_level=rr,
+        is_fresh=is_fresh,
     )
     conf_reason, conf_score, active = _confluence_block(factors)
     assessment["confluence_score"] = conf_score
     assessment["confluence_factors"] = active
+    assessment["rr_to_level"] = round(rr, 3)
     if CONFLUENCE_FILTER_ON and conf_reason:
         return conf_reason, "confluence", {"confluence_score": conf_score, "factors": active}, assessment
 
-    # Layer 3 — market structure (support/resistance risk-reward)
-    nearest_resistance, nearest_support = _nearest_levels(
-        float(sig["current"]), ta["swing_highs"], ta["swing_lows"]
-    )
+    # Layer 3 — market structure (breakout: broken level / range; else profit-side R/R).
     struct_reason, dist_atr = _structure_block(
-        side, float(sig["current"]), ta["atr_4h"], nearest_resistance, nearest_support
+        side, sig.get("strategy", ""), current, ta["atr_4h"], profit_level, range_atr,
     )
     assessment["nearest_resistance"] = nearest_resistance
     assessment["nearest_support"] = nearest_support
     assessment["distance_to_level_atr"] = dist_atr
+    assessment["range_atr"] = range_atr
     if STRUCTURE_FILTER_ON and struct_reason:
         return (
             struct_reason,
@@ -496,6 +568,7 @@ def _apply_thinking_filters(
                 "nearest_resistance": nearest_resistance,
                 "nearest_support": nearest_support,
                 "distance_to_level_atr": dist_atr,
+                "range_atr": range_atr,
             },
             assessment,
         )
@@ -2004,6 +2077,10 @@ def export_futures_csv(days: int = 30) -> Path:
         "opened_at", "closed_at",
         "er_condition", "er_ema9", "er_ema30", "er_atr", "er_deviation",
         "er_high20", "er_low20", "er_breakout_pct",
+        # Thinking-layer assessment (Layer 1/2/3) for offline attribution.
+        "trend_1d", "trend_4h", "trend_1h",
+        "confluence_score", "confluence_factors", "rr_to_level",
+        "nearest_resistance", "nearest_support", "distance_to_level_atr", "range_atr",
     ]
 
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -2012,6 +2089,8 @@ def export_futures_csv(days: int = 30) -> Path:
         for row in closed:
             er = row.get("entry_reason") or {}
             sc = row.get("score_components") or {}
+            tk = row.get("thinking") or {}
+            cf = tk.get("confluence_factors")
             writer.writerow({
                 "strategy": row.get("strategy"),
                 "side": row.get("side"),
@@ -2053,6 +2132,16 @@ def export_futures_csv(days: int = 30) -> Path:
                 "er_high20": er.get("high20"),
                 "er_low20": er.get("low20"),
                 "er_breakout_pct": er.get("breakout_pct"),
+                "trend_1d": tk.get("trend_1d"),
+                "trend_4h": tk.get("trend_4h"),
+                "trend_1h": tk.get("trend_1h"),
+                "confluence_score": tk.get("confluence_score"),
+                "confluence_factors": "|".join(cf) if isinstance(cf, list) else cf,
+                "rr_to_level": tk.get("rr_to_level"),
+                "nearest_resistance": tk.get("nearest_resistance"),
+                "nearest_support": tk.get("nearest_support"),
+                "distance_to_level_atr": tk.get("distance_to_level_atr"),
+                "range_atr": tk.get("range_atr"),
             })
 
     return path
